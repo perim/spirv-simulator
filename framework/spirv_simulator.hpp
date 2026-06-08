@@ -477,6 +477,39 @@ struct PointerV
     std::vector<uint32_t> idx_path;
 };
 
+struct PointerLocationKey
+{
+    uint32_t storage_class;
+    uint32_t base_result_id;
+    uint64_t pointer_handle;
+    uint64_t byte_offset;
+    std::vector<uint32_t> idx_path;
+
+    bool operator==(const PointerLocationKey& other) const
+    {
+        return storage_class == other.storage_class &&
+               base_result_id == other.base_result_id &&
+               pointer_handle == other.pointer_handle &&
+               byte_offset == other.byte_offset &&
+               idx_path == other.idx_path;
+    }
+};
+
+struct PointerLocationKeyHash
+{
+    std::size_t operator()(const PointerLocationKey& key) const
+    {
+        std::size_t h = 0;
+        auto hash_combine = [&h](std::size_t v) { h ^= v + 0x9e3779b9 + (h << 6) + (h >> 2); };
+        hash_combine(std::hash<uint32_t>{}(key.storage_class));
+        hash_combine(std::hash<uint32_t>{}(key.base_result_id));
+        hash_combine(std::hash<uint64_t>{}(key.pointer_handle));
+        hash_combine(std::hash<uint64_t>{}(key.byte_offset));
+        for (uint32_t idx : key.idx_path) hash_combine(std::hash<uint32_t>{}(idx));
+        return h;
+    }
+};
+
 inline bool operator==(const PointerV& a, const PointerV& b)
 {
   return a.pointer_handle == b.pointer_handle &&
@@ -991,10 +1024,8 @@ class SPIRVSimulator
     // common case where a store and a later load use different OpAccessChain
     // result IDs that resolve to the same memory.
     //
-    // The key is deliberately a string instead of a custom struct hash to keep
-    // this helper self-contained in the simulator. The key encodes storage
-    // class, base object, byte offset and access path.
-    std::unordered_map<std::string, uint32_t> values_stored_by_memory_location_;
+    // The key encodes storage class, base object, byte offset and access path.
+    std::unordered_map<PointerLocationKey, uint32_t, PointerLocationKeyHash> values_stored_by_memory_location_;
 
     // For OpFunctionCall results, the source IDs inside the callee are not
     // always safe to chase after returning, especially when locals/parameters
