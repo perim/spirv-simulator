@@ -18,7 +18,7 @@ constexpr uint32_t kWordCountShift = 16u;
 constexpr uint32_t kOpcodeMask     = 0xFFFFu;
 const std::string  execIndent      = "                      # ";
 
-static inline bool SPIRVIsFloatOp(spv::Op op)
+static inline constexpr bool SPIRVIsFloatOp(spv::Op op)
 {
     switch (op) {
         // ---- Floating-point arithmetic ----
@@ -45,7 +45,7 @@ static inline bool SPIRVIsFloatOp(spv::Op op)
     }
 }
 
-static inline bool SPIRVIsArithmeticOp(spv::Op op)
+static inline constexpr bool SPIRVIsArithmeticOp(spv::Op op)
 {
     switch (op) {
         // ---- Integer arithmetic ----
@@ -84,7 +84,7 @@ static inline bool SPIRVIsArithmeticOp(spv::Op op)
     }
 }
 
-static bool IsRelationalIntCompare(spv::Op op)
+static inline constexpr bool IsRelationalIntCompare(spv::Op op)
 {
     switch (op) {
         case spv::Op::OpULessThan:
@@ -126,6 +126,10 @@ static std::vector<PhiIncoming> GetPhiIncoming(const Instruction& phi)
 {
     std::vector<PhiIncoming> incoming;
     const uint32_t wc = phi.word_count;
+    if (wc > 3)
+    {
+        incoming.reserve((wc - 3) / 2);
+    }
 
     // Start at operand index 3 (value,label pairs)
     for (uint32_t i = 3; i + 1 < wc; i += 2) {
@@ -138,7 +142,7 @@ static std::vector<PhiIncoming> GetPhiIncoming(const Instruction& phi)
     return incoming;
 }
 
-const char* StorageClassName(spv::StorageClass sc)
+constexpr const char* StorageClassName(spv::StorageClass sc)
 {
     switch (sc) {
         case spv::StorageClassUniformConstant: return "UniformConstant";
@@ -164,7 +168,7 @@ bool SPIRVSimulator::IsLoopCounterPhi(uint32_t candidate_id) const
     This function tries to detect if a OpPhi instruction is used for the common loop counter pattern in spirv-code
     generated using the khronos tools to compile it from higher level languages.
     */
-    const Instruction& def = instructions_[result_id_to_inst_index_.at(candidate_id)];
+    const Instruction& def = instructions_[GetInstructionIndexForResultId(candidate_id)];
     if (def.opcode != spv::Op::OpPhi)
     {
         return false;
@@ -186,7 +190,7 @@ bool SPIRVSimulator::IsLoopCounterPhi(uint32_t candidate_id) const
     uint32_t header_label   = header.label;
     uint32_t continue_label = header.loop_continue;
 
-    for (auto& inc : incoming) {
+    for (const auto& inc : incoming) {
         if (inc.parent_label == continue_label) {
             from_continue_val = inc.value_id;
             break;
@@ -248,7 +252,7 @@ uint32_t SPIRVSimulator::DeriveDescriptorSizeID(const Instruction& branch_inst) 
     assertm(branch_inst.opcode == spv::Op::OpBranchConditional, "SPIRV-Simulator: DeriveDescriptorSizeID called on non-OpBranchConditional instruction");
 
     uint32_t cond_id = branch_inst.words[1];
-    const Instruction& cond_inst = instructions_[result_id_to_inst_index_.at(cond_id)];
+    const Instruction& cond_inst = instructions_[GetInstructionIndexForResultId(cond_id)];
 
     // If this is not a integer comparison, assume the loop is not used for descriptor writeout
     if (!IsRelationalIntCompare(cond_inst.opcode))
@@ -290,9 +294,11 @@ LoopInfo BuildLoopRegion(const CFG& cfg, uint32_t header)
 {
     const auto& H = cfg.blocks.at(header);
     LoopInfo L{header, H.loop_merge, H.loop_continue, {}, {}};
+    L.blocks.reserve(cfg.blocks.size());
 
     std::queue<uint32_t> q;
-    std::set<uint32_t> seen;
+    UnorderedSet<uint32_t> seen;
+    seen.reserve(cfg.blocks.size());
     q.push(header);
     seen.insert(header);
 
@@ -361,6 +367,10 @@ SPIRVSimulator::SPIRVSimulator(const std::vector<uint32_t>& program_words,
 
 void SPIRVSimulator::BuildCFGFromWords()
 {
+    cfg_.blocks.reserve(ids_per_instruction_.size());
+    cfg_.preds.reserve(ids_per_instruction_.size());
+    cfg_.block_order.reserve(ids_per_instruction_.size());
+
     uint32_t instruction_index = 0;
     for (size_t i = 5; i < program_words_.size(); ) {
         uint32_t first    = program_words_[i];
@@ -462,13 +472,13 @@ void SPIRVSimulator::DecodeHeader()
     stream_ = std::span<const uint32_t>(program_words_).subspan(5);
 }
 
-void SPIRVSimulator::Validate()
+void SPIRVSimulator::Validate() const
 {
     /*
     Do some early sanity checking and validation.
     */
     // TODO: Expand this (a lot)
-    for (auto& [id, t] : types_)
+    for (const auto& [id, t] : types_)
     {
         assertm(!(t.kind == Type::Kind::Array && !types_.contains(t.array.elem_type_id)),
                 "SPIRV simulator: Missing  array elem type");
@@ -502,6 +512,11 @@ void SPIRVSimulator::Validate()
 
 void SPIRVSimulator::ParseAll()
 {
+    const size_t instruction_count = ids_per_instruction_.size();
+    instructions_.reserve(instruction_count);
+    block_label_per_instruction_.reserve(instruction_count);
+    result_id_to_inst_index_.assign(program_words_[3], kInvalidInstructionIndex);
+
     size_t instruction_index = 0;
 
     if (verbose_)
@@ -551,13 +566,11 @@ void SPIRVSimulator::ParseAll()
         {
             if (has_type)
             {
-                result_id_to_inst_index_[instruction.words[2]] = instruction_index;
-                num_result_ids_                                = std::max(num_result_ids_, instruction.words[2]) + 1;
+                SetInstructionIndexForResultId(instruction.words[2], instruction_index);
             }
             else
             {
-                result_id_to_inst_index_[instruction.words[1]] = instruction_index;
-                num_result_ids_                                = std::max(num_result_ids_, instruction.words[1]) + 1;
+                SetInstructionIndexForResultId(instruction.words[1], instruction_index);
             }
         }
 
@@ -1273,7 +1286,7 @@ void SPIRVSimulator::on_loop_iteration(uint32_t header)
     {
         // Just jump to the merge block of the current loop
         const LoopInfo& current_loop = loops_[header];
-        call_stack_.back().pc = result_id_to_inst_index_.at(current_loop.merge);
+        call_stack_.back().pc = GetInstructionIndexForResultId(current_loop.merge);
         std::cout << "SPIRV simulator: WARNING: Loop reached the max number of debug iterations, jumping to merge block and exiting loop" << std::endl;
         simulation_results_->aborted_long_loop = true;
     }
@@ -1332,7 +1345,7 @@ void SPIRVSimulator::HandleUnimplementedOpcode(const Instruction& instruction)
     }
 }
 
-std::string SPIRVSimulator::GetValueString(const Value& value)
+std::string SPIRVSimulator::GetValueString(const Value& value) const
 {
     if (std::holds_alternative<double>(value))
     {
@@ -1374,7 +1387,7 @@ std::string SPIRVSimulator::GetValueString(const Value& value)
     return "";
 }
 
-std::string SPIRVSimulator::GetTypeString(const Type& type)
+std::string SPIRVSimulator::GetTypeString(const Type& type) const
 {
     if (type.kind == Type::Kind::Void)
     {
@@ -1449,7 +1462,7 @@ std::string SPIRVSimulator::GetTypeString(const Type& type)
     return "";
 }
 
-void SPIRVSimulator::PrintInstruction(const Instruction& instruction)
+void SPIRVSimulator::PrintInstruction(const Instruction& instruction) const
 {
     bool has_result = false;
     bool has_type   = false;
@@ -1701,10 +1714,7 @@ const Type& SPIRVSimulator::GetTypeByResultId(uint32_t result_id) const
     Returns the type struct mapping to a given result_id.
     result_id must be the result ID of a spirv instruction.
     */
-    assertm(result_id_to_inst_index_.find(result_id) != result_id_to_inst_index_.end(),
-            "SPIRV simulator: No instruction found for result_id");
-
-    size_t             instruction_index = result_id_to_inst_index_.at(result_id);
+    size_t             instruction_index = GetInstructionIndexForResultId(result_id);
     const Instruction& instruction       = instructions_[instruction_index];
 
     bool has_result = false;
@@ -1736,20 +1746,7 @@ const Type& SPIRVSimulator::GetTypeByTypeId(uint32_t type_id) const
 //  Value creation and inspect helpers
 // ---------------------------------------------------------------------------
 
-size_t CountBitsUInt(uint64_t value, size_t max_bits)
-{
-    size_t count = 0;
-
-    while (max_bits)
-    {
-        count += value & 1;
-        value >>= 1;
-        max_bits -= 1;
-    }
-    return count;
-}
-
-size_t SPIRVSimulator::CountSetBits(const Value& value, uint32_t type_id, bool* is_arbitrary)
+size_t SPIRVSimulator::CountSetBits(const Value& value, uint32_t type_id, bool* is_arbitrary) const
 {
     assertm(types_.find(type_id) != types_.end(), "SPIRV simulator: No valid type for the given ID was found");
 
@@ -1911,7 +1908,7 @@ size_t SPIRVSimulator::GetBitsizeOfType(uint32_t type_id) const
     return bitcount;
 }
 
-uint32_t SPIRVSimulator::GetTargetPointerType(const PointerV& pointer)
+uint32_t SPIRVSimulator::GetTargetPointerType(const PointerV& pointer) const
 {
     assertm(types_.find(pointer.base_type_id) != types_.end(),
             "SPIRV simulator: No valid type for the given pointer type ID was found");
@@ -1958,7 +1955,7 @@ uint32_t SPIRVSimulator::GetTargetPointerType(const PointerV& pointer)
     return type_id;
 }
 
-size_t SPIRVSimulator::GetBitsizeOfTargetType(const PointerV& pointer)
+size_t SPIRVSimulator::GetBitsizeOfTargetType(const PointerV& pointer) const
 {
     /*
     Returns the full bitsize of the type pointed to by the given pointer.
@@ -1972,7 +1969,7 @@ size_t SPIRVSimulator::GetBitsizeOfTargetType(const PointerV& pointer)
     return GetBitsizeOfType(type_id);
 }
 
-void SPIRVSimulator::GetBaseTypeIDs(uint32_t type_id, std::vector<uint32_t>& output)
+void SPIRVSimulator::GetBaseTypeIDs(uint32_t type_id, std::vector<uint32_t>& output) const
 {
     /*
     Gets all the scalar types in a compond types, laid out as they are in memory.
@@ -2053,7 +2050,7 @@ bool SPIRVSimulator::IsMemberOfStruct(uint32_t member_id, uint32_t& struct_id, u
     return false;
 }
 
-void SPIRVSimulator::ReadWords(const std::byte* external_pointer, uint32_t type_id, std::vector<uint32_t>& buffer_data)
+void SPIRVSimulator::ReadWords(const std::byte* external_pointer, uint32_t type_id, std::vector<uint32_t>& buffer_data) const
 {
     /*
     Extracts 32 bit word values with type matching type_id from the external_pointer byte buffer
@@ -2184,7 +2181,7 @@ void SPIRVSimulator::ReadWords(const std::byte* external_pointer, uint32_t type_
     }
 }
 
-void SPIRVSimulator::WriteValue(std::byte* external_pointer, uint32_t type_id, const Value& value)
+void SPIRVSimulator::WriteValue(std::byte* external_pointer, uint32_t type_id, const Value& value) const
 {
     /*
     Writes the value stored in result_id to the external pointer
@@ -2593,10 +2590,7 @@ uint32_t SPIRVSimulator::GetTypeID(uint32_t result_id) const
     /*
     Given a result ID, return the type ID of the value it maps to.
     */
-    assertm(result_id_to_inst_index_.find(result_id) != result_id_to_inst_index_.end(),
-            "SPIRV simulator: No instruction found for result_id");
-
-    size_t             instruction_index = result_id_to_inst_index_.at(result_id);
+    size_t             instruction_index = GetInstructionIndexForResultId(result_id);
     const Instruction& instruction       = instructions_[instruction_index];
 
     bool has_result = false;
@@ -2612,7 +2606,7 @@ uint32_t SPIRVSimulator::GetTypeID(uint32_t result_id) const
     return 0;
 }
 
-Value SPIRVSimulator::MakeScalar(uint32_t type_id, const uint32_t*& words)
+Value SPIRVSimulator::MakeScalar(uint32_t type_id, const uint32_t*& words) const
 {
     const Type& type = GetTypeByTypeId(type_id);
 
@@ -2792,7 +2786,9 @@ Value SPIRVSimulator::MakeDefault(uint32_t type_id, const uint32_t** initial_dat
         case Type::Kind::Struct:
         {
             auto structure = std::make_shared<AggregateV>();
-            for (auto member : struct_members_.at(type_id))
+            const auto& members = struct_members_.at(type_id);
+            structure->elems.reserve(members.size());
+            for (auto member : members)
             {
                 structure->elems.push_back(MakeDefault(member, initial_data));
             }
@@ -2888,7 +2884,7 @@ static void AppendDataSources(std::vector<DataSourceBits>& dst, const std::vecto
 static PointerLocationKey MakePointerLocationKey(const PointerV& pointer, uint64_t byte_offset)
 {
     // This runs in the hottest load/store path. Use custom struct instead of strings for performance.
-    return {
+    return PointerLocationKey{
         static_cast<uint32_t>(pointer.storage_class),
         pointer.base_result_id,
         pointer.pointer_handle,
@@ -2941,18 +2937,18 @@ std::vector<DataSourceBits> SPIRVSimulator::FindDataSourcesFromResultID(
     uint32_t result_id,
     uint32_t* property_flags)
 {
-    std::unordered_set<uint32_t> visiting;
+    UnorderedSet<uint32_t> visiting;
     return FindDataSourcesFromResultIDImpl(result_id, property_flags, visiting, nullptr, DataTraceRole::RawValue);
 }
 
 std::vector<DataSourceBits> SPIRVSimulator::FindDataSourcesFromResultIDImpl(
     uint32_t result_id,
     uint32_t* property_flags,
-    std::unordered_set<uint32_t>& visiting,
+    UnorderedSet<uint32_t>& visiting,
     bool* trace_depends_on_memory,
     DataTraceRole trace_role)
 {
-    if (!result_id_to_inst_index_.contains(result_id))
+    if (!HasInstructionForResultId(result_id))
     {
         return {};
     }
@@ -2993,7 +2989,7 @@ std::vector<DataSourceBits> SPIRVSimulator::FindDataSourcesFromResultIDImpl(
 
     std::vector<DataSourceBits> results;
 
-    uint32_t           instruction_index = result_id_to_inst_index_.at(result_id);
+    uint32_t           instruction_index = GetInstructionIndexForResultId(result_id);
     const Instruction& instruction       = instructions_[instruction_index];
 
     bool has_result = false;
@@ -3033,7 +3029,7 @@ std::vector<DataSourceBits> SPIRVSimulator::FindDataSourcesFromResultIDImpl(
     const bool propagate_value_property_flags = (trace_role == DataTraceRole::RawValue);
 
     auto trace_id_with_role = [&](uint32_t id, DataTraceRole child_role) {
-        if (id == 0 || !result_id_to_inst_index_.contains(id))
+        if (id == 0 || !HasInstructionForResultId(id))
         {
             return;
         }
@@ -3084,7 +3080,7 @@ std::vector<DataSourceBits> SPIRVSimulator::FindDataSourcesFromResultIDImpl(
         }
     };
 
-    const std::vector<uint32_t> id_operands = ids_per_instruction_[instruction_index];
+    const std::vector<uint32_t>& id_operands = ids_per_instruction_[instruction_index];
 
     switch (instruction.opcode)
     {
@@ -3310,7 +3306,7 @@ std::vector<DataSourceBits> SPIRVSimulator::FindDataSourcesFromResultIDImpl(
                 }
 
                 std::pair<std::byte*, uint64_t> resolved_ptr = ResolvePointerV(pointer);
-                auto key = MakePointerLocationKey(pointer, resolved_ptr.second);
+                PointerLocationKey key = MakePointerLocationKey(pointer, resolved_ptr.second);
 
                 auto by_location = values_stored_by_memory_location_.find(key);
                 if (by_location != values_stored_by_memory_location_.end() && by_location->second != result_id)
@@ -3403,10 +3399,9 @@ std::vector<DataSourceBits> SPIRVSimulator::FindDataSourcesFromResultIDImpl(
             // essential for loops, where the backedge value represents the
             // previous iteration's contribution. Cycle detection above prevents
             // infinite recursion on self-referential loop phis.
-            auto incoming = GetPhiIncoming(instruction);
-            for (const PhiIncoming& inc : incoming)
+            for (uint32_t operand_index = 3; operand_index + 1 < instruction.word_count; operand_index += 2)
             {
-                trace_id(inc.value_id);
+                trace_id(instruction.words[operand_index]);
             }
             break;
         }
@@ -3472,8 +3467,10 @@ Value SPIRVSimulator::CopyValue(const Value& value) const
     if (std::holds_alternative<std::shared_ptr<VectorV>>(value))
     {
         std::shared_ptr<VectorV> new_vector = std::make_shared<VectorV>();
+        const auto& old_elems = std::get<std::shared_ptr<VectorV>>(value)->elems;
+        new_vector->elems.reserve(old_elems.size());
 
-        for (const auto& elem : std::get<std::shared_ptr<VectorV>>(value)->elems)
+        for (const auto& elem : old_elems)
         {
             new_vector->elems.push_back(CopyValue(elem));
         }
@@ -3483,8 +3480,10 @@ Value SPIRVSimulator::CopyValue(const Value& value) const
     else if (std::holds_alternative<std::shared_ptr<MatrixV>>(value))
     {
         std::shared_ptr<MatrixV> new_matrix = std::make_shared<MatrixV>();
+        const auto& old_cols = std::get<std::shared_ptr<MatrixV>>(value)->cols;
+        new_matrix->cols.reserve(old_cols.size());
 
-        for (const auto& col : std::get<std::shared_ptr<MatrixV>>(value)->cols)
+        for (const auto& col : old_cols)
         {
             new_matrix->cols.push_back(CopyValue(col));
         }
@@ -3494,8 +3493,10 @@ Value SPIRVSimulator::CopyValue(const Value& value) const
     else if (std::holds_alternative<std::shared_ptr<AggregateV>>(value))
     {
         std::shared_ptr<AggregateV> new_aggregate = std::make_shared<AggregateV>();
+        const auto& old_elems = std::get<std::shared_ptr<AggregateV>>(value)->elems;
+        new_aggregate->elems.reserve(old_elems.size());
 
-        for (const auto& elem : std::get<std::shared_ptr<AggregateV>>(value)->elems)
+        for (const auto& elem : old_elems)
         {
             new_aggregate->elems.push_back(CopyValue(elem));
         }
@@ -5456,6 +5457,7 @@ void SPIRVSimulator::Op_CompositeConstruct(const Instruction& instruction)
     if (type.kind == Type::Kind::Vector)
     {
         auto vec = std::make_shared<VectorV>();
+        vec->elems.reserve(type.vector.elem_count);
         for (auto i = 3; i < instruction.word_count; ++i)
         {
             const Value& component_value = GetValue(instruction.words[i]);
@@ -5465,7 +5467,7 @@ void SPIRVSimulator::Op_CompositeConstruct(const Instruction& instruction)
             {
                 std::shared_ptr<VectorV> component_vector = std::get<std::shared_ptr<VectorV>>(component_value);
 
-                for (auto& vec_component : component_vector->elems)
+                for (const auto& vec_component : component_vector->elems)
                 {
                     vec->elems.push_back(vec_component);
                 }
@@ -5481,6 +5483,7 @@ void SPIRVSimulator::Op_CompositeConstruct(const Instruction& instruction)
     else if (type.kind == Type::Kind::Matrix)
     {
         auto matrix = std::make_shared<MatrixV>();
+        matrix->cols.reserve(instruction.word_count - 3);
         for (auto i = 3; i < instruction.word_count; ++i)
         {
           ExtractFlags(instruction.words[i], value_meta);
@@ -5492,6 +5495,7 @@ void SPIRVSimulator::Op_CompositeConstruct(const Instruction& instruction)
     else if (type.kind == Type::Kind::Struct || type.kind == Type::Kind::Array || type.kind == Type::Kind::RuntimeArray)
     {
         auto aggregate = std::make_shared<AggregateV>();
+        aggregate->elems.reserve(instruction.word_count - 3);
         for (auto i = 3; i < instruction.word_count; ++i)
         {
           ExtractFlags(instruction.words[i], value_meta);
@@ -5887,14 +5891,14 @@ void SPIRVSimulator::Op_Store(const Instruction& instruction)
                     uint32_t loop_merge_id = cfg_.blocks[current_block_id_].loop_merge;
                     uint32_t loop_terminator_id = loop_merge_id + 1;
 
-                    const Instruction& terminator_instruction = instructions_[result_id_to_inst_index_[loop_terminator_id]];
+                    const Instruction& terminator_instruction = instructions_[GetInstructionIndexForResultId(loop_terminator_id)];
 
                     // If loop merge is immidiately followed by a OpBranchConditional we take the conditional and use it to derive the size
                     if (terminator_instruction.opcode == spv::Op::OpBranchConditional)
                     {
                         is_static_writeout = false;
                         uint32_t condition_id = terminator_instruction.words[1];
-                        const Instruction& condition_instruction = instructions_[result_id_to_inst_index_[condition_id]];
+                        const Instruction& condition_instruction = instructions_[GetInstructionIndexForResultId(condition_id)];
 
                         descriptor_size_id = DeriveDescriptorSizeID(condition_instruction);
 
@@ -6093,6 +6097,7 @@ void SPIRVSimulator::Op_AccessChain(const Instruction& instruction)
             "SPIRV simulator: Attempt to use OpAccessChain on a non-pointer value");
 
     PointerV new_pointer = std::get<PointerV>(base_value);
+    new_pointer.idx_path.reserve(new_pointer.idx_path.size() + instruction.word_count - 4);
 
     if (values_stored_.find(base_id) != values_stored_.end())
     {
@@ -6271,7 +6276,7 @@ void SPIRVSimulator::Op_Branch(const Instruction& instruction)
     assert(instruction.opcode == spv::Op::OpBranch);
 
     uint32_t result_id    = instruction.words[1];
-    call_stack_.back().pc = result_id_to_inst_index_.at(result_id);
+    call_stack_.back().pc = GetInstructionIndexForResultId(result_id);
 }
 
 void SPIRVSimulator::Op_BranchConditional(const Instruction& instruction)
@@ -6363,7 +6368,7 @@ void SPIRVSimulator::Op_BranchConditional(const Instruction& instruction)
         visisted_fork_branches_->insert(target_label);
     }
 
-    call_stack_.back().pc = result_id_to_inst_index_.at(target_label);
+    call_stack_.back().pc = GetInstructionIndexForResultId(target_label);
 }
 
 void SPIRVSimulator::Op_Return(const Instruction& instruction)
@@ -10643,7 +10648,7 @@ void SPIRVSimulator::Op_Switch(const Instruction& instruction)
 
     // TODO: Create a execution for if appropriate
 
-    call_stack_.back().pc = result_id_to_inst_index_.at(label_id);
+    call_stack_.back().pc = GetInstructionIndexForResultId(label_id);
 }
 
 void SPIRVSimulator::Op_MatrixTimesVector(const Instruction& instruction)
