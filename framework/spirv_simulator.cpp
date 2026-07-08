@@ -13649,11 +13649,34 @@ void SPIRVSimulator::Op_SDiv(const Instruction& instruction)
         {
             Value elem_result;
 
-            // TODO: Operands dont have to be signed, deal with it and remove the asserts
-            assertmc(std::holds_alternative<int64_t>(vec1->elems[i]) && std::holds_alternative<int64_t>(vec2->elems[i]),
-                    "SPIRV simulator: Found non-signed int operand vector operands");
+            int64_t op1_val;
+            if (std::holds_alternative<int64_t>(vec1->elems[i]))
+            {
+                op1_val = std::get<int64_t>(vec1->elems[i]);
+            }
+            else if (std::holds_alternative<uint64_t>(vec1->elems[i]))
+            {
+                op1_val = bit_cast<int64_t>(std::get<uint64_t>(vec1->elems[i]));
+            }
+            else
+            {
+                assertxc("SPIRV simulator: Invalid vector element type encountered in Op_SDiv operands");
+            }
 
-            int64_t op2 = std::get<int64_t>(vec2->elems[i]);
+            int64_t op2 = 0;
+            if (std::holds_alternative<int64_t>(vec2->elems[i]))
+            {
+                op2 = std::get<int64_t>(vec2->elems[i]);
+            }
+            else if (std::holds_alternative<uint64_t>(vec2->elems[i]))
+            {
+                op2 = bit_cast<int64_t>(std::get<uint64_t>(vec2->elems[i]));
+            }
+            else
+            {
+                assertxc("SPIRV simulator: Invalid vector element type encountered in Op_SDiv operands");
+            }
+
             if (op2 == 0)
             {
                 if (verbose_)
@@ -13665,7 +13688,7 @@ void SPIRVSimulator::Op_SDiv(const Instruction& instruction)
                 op2 = 1;
             }
 
-            elem_result = std::get<int64_t>(vec1->elems[i]) / op2;
+            elem_result = op1_val / op2;
 
             result_vec->elems.push_back(elem_result);
         }
