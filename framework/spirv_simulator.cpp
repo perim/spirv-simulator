@@ -1850,27 +1850,44 @@ void SPIRVSimulator::PrintInstruction(const Instruction& instruction) const
 
     if (instruction.opcode == spv::Op::OpExtInstImport)
     {
-        std::cout << std::string((char*)(&instruction.words[2]), (instruction.word_count - 2) * 4);
+        if (instruction.word_count > 2)
+        {
+            std::cout << std::string((char*)(&instruction.words[2]), (instruction.word_count - 2) * 4);
+        }
     }
     else if (instruction.opcode == spv::Op::OpName)
     {
-        std::cout << instruction.words[1] << " ";
-        std::cout << std::string((char*)(&instruction.words[2]), (instruction.word_count - 2) * 4);
+        if (instruction.word_count > 1) std::cout << instruction.words[1] << " ";
+        if (instruction.word_count > 2)
+        {
+            std::cout << std::string((char*)(&instruction.words[2]), (instruction.word_count - 2) * 4);
+        }
     }
     else if (instruction.opcode == spv::Op::OpMemberName)
     {
-        std::cout << instruction.words[1] << " " << instruction.words[2] << " ";
-        std::cout << std::string((char*)(&instruction.words[3]), (instruction.word_count - 3) * 4);
+        if (instruction.word_count > 1) std::cout << instruction.words[1] << " ";
+        if (instruction.word_count > 2) std::cout << instruction.words[2] << " ";
+        if (instruction.word_count > 3)
+        {
+            std::cout << std::string((char*)(&instruction.words[3]), (instruction.word_count - 3) * 4);
+        }
     }
     else if (instruction.opcode == spv::Op::OpExtension)
     {
-        std::cout << instruction.words[1] << " ";
-        std::cout << std::string((char*)(&instruction.words[2]), (instruction.word_count - 2) * 4);
+        if (instruction.word_count > 1) std::cout << instruction.words[1] << " ";
+        if (instruction.word_count > 2)
+        {
+            std::cout << std::string((char*)(&instruction.words[2]), (instruction.word_count - 2) * 4);
+        }
     }
     else if (instruction.opcode == spv::Op::OpEntryPoint)
     {
-        std::cout << instruction.words[1] << " " << instruction.words[2] << " ";
-        std::cout << std::string((char*)(&instruction.words[3]), (instruction.word_count - 3) * 4);
+        if (instruction.word_count > 1) std::cout << instruction.words[1] << " ";
+        if (instruction.word_count > 2) std::cout << instruction.words[2] << " ";
+        if (instruction.word_count > 3)
+        {
+            std::cout << std::string((char*)(&instruction.words[3]), (instruction.word_count - 3) * 4);
+        }
     }
     else if (instruction.opcode == spv::Op::OpLine)
     {
@@ -6529,6 +6546,11 @@ void SPIRVSimulator::Op_ExtInstImport(const Instruction& instruction)
     */
     assert(instruction.opcode == spv::Op::OpExtInstImport);
 
+    if (instruction.word_count < 3)
+    {
+        return;
+    }
+
     uint32_t result_id = instruction.words[1];
     // SPIRV string literals are UTF-8 encoded, so basic c++ string functionality can be used to decode them
     extended_imports_[result_id] = std::string((char*)(&instruction.words[2]), (instruction.word_count - 2) * 4);
@@ -8651,6 +8673,11 @@ void SPIRVSimulator::Op_Name(const Instruction& instruction)
     Name is the string to assign.
     */
     assert(instruction.opcode == spv::Op::OpName);
+
+    if (instruction.word_count < 3)
+    {
+        return;
+    }
 
     uint32_t target_id = instruction.words[1];
 
