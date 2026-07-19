@@ -10833,7 +10833,23 @@ void SPIRVSimulator::Op_ConvertUToPtr(const Instruction& instruction)
     const std::byte* remapped_pointer = RemapPhysicalToHostPointer(pointer_value);
 
     PointerV new_pointer{ bit_cast<uint64_t>(remapped_pointer), 0, type_id, result_id, type.pointer.storage_class, {} };
-    // TODO: Derive IDX path from buffer_offset_bytes, assume whole array is packed with same type as pointee type
+
+    for (const auto& entry : simulation_data_->physical_address_buffers)
+    {
+        uint64_t buffer_address = entry.first;
+        size_t   buffer_size    = entry.second.first;
+        if (pointer_value >= buffer_address && pointer_value < buffer_address + buffer_size)
+        {
+            uint64_t buffer_offset_bytes = pointer_value - buffer_address;
+            size_t target_size_bytes = GetBitsizeOfTargetType(new_pointer) / 8;
+            if (target_size_bytes > 0)
+            {
+                new_pointer.idx_path.push_back(static_cast<uint32_t>(buffer_offset_bytes / target_size_bytes));
+            }
+            break;
+        }
+    }
+
     physical_address_pointers_.push_back(new_pointer);
     SetValue(result_id, new_pointer);
 
