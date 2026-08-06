@@ -12210,11 +12210,15 @@ void SPIRVSimulator::Op_ConstantNull(const Instruction& instruction)
     uint32_t    result_id = instruction.words[2];
     const Type& type      = GetTypeByTypeId(type_id);
 
-    // TODO: This will crash for most pointers, we have to handle that case without MakeDefault
-    assertmc(type.kind != Type::Kind::Pointer,
-            "SPIRV simulator: Op_ConstantNull for pointer types is currently not supported");
-
-    SetValue(result_id, MakeDefault(type_id));
+    if (type.kind == Type::Kind::Pointer)
+    {
+        PointerV null_pointer{ 0, 0, type_id, result_id, type.pointer.storage_class, {} };
+        SetValue(result_id, null_pointer);
+    }
+    else
+    {
+        SetValue(result_id, MakeDefault(type_id));
+    }
 }
 
 void SPIRVSimulator::Op_AtomicIAdd(const Instruction& instruction)
