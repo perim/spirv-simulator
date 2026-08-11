@@ -23,6 +23,7 @@ namespace SPIRVSimulator
 constexpr uint32_t kWordCountShift = 16u;
 constexpr uint32_t kOpcodeMask     = 0xFFFFu;
 const std::string  execIndent      = "                      # ";
+constexpr uint64_t kMaxDenseReadSidePointerSlots = 65536u;
 
 static inline uint16_t FloatToHalfBits(float value)
 {
@@ -597,15 +598,18 @@ void SPIRVSimulator::DecodeHeader()
     uint32_t magic_number = program_words_[0];
     assertm(magic_number == 0x07230203, "SPIRV simulator: Magic SPIRV header number is invalid, should be: 0x07230203");
 
+    spirv_version_ = program_words_[1];
+
     if (verbose_)
     {
-        uint32_t version   = program_words_[1];
-        uint32_t generator = program_words_[2];
-        uint32_t bound     = program_words_[3];
-        uint32_t schema    = program_words_[4];
+        uint32_t version_major = (spirv_version_ >> 16) & 0xFFu;
+        uint32_t version_minor = (spirv_version_ >> 8) & 0xFFu;
+        uint32_t generator     = program_words_[2];
+        uint32_t bound         = program_words_[3];
+        uint32_t schema        = program_words_[4];
 
         std::cout << "SPIRV simulator: Shader header parsed as:" << std::endl;
-        std::cout << execIndent << "Version: " << version << std::endl;
+        std::cout << execIndent << "Version: " << version_major << "." << version_minor << std::endl;
         std::cout << execIndent << "Generator: " << generator << std::endl;
         std::cout << execIndent << "Bound: " << bound << std::endl;
         std::cout << execIndent << "Schema: " << schema << std::endl << std::endl;
@@ -3359,13 +3363,397 @@ void SPIRVSimulator::DeriveActiveComputeLocalSize(uint32_t entry_point_function_
     }
 }
 
+void SPIRVSimulator::CopyNonFlagValueMetadata(uint32_t target_rid, uint32_t source_rid)
+{
+    ValueMetadata& dst = value_meta_[target_rid];
+    const ValueMetadata& src = value_meta_[source_rid];
+    dst.value_range = src.value_range;
+    dst.component_ranges = src.component_ranges;
+    dst.subobject_scalar_ranges = src.subobject_scalar_ranges;
+    dst.address_range_valid = src.address_range_valid;
+    dst.address_range_min = src.address_range_min;
+    dst.address_range_max = src.address_range_max;
+    dst.address_range_stride = src.address_range_stride;
+    dst.address_element_size = src.address_element_size;
+}
+
+bool SPIRVSimulator::TryBuildVectorShuffleComponentRanges(uint32_t result_id,
+                                                          uint32_t vec1_id,
+                                                          uint32_t vec2_id,
+                                                          const Instruction& instruction)
+{
+    const ValueMetadata& src1 = value_meta_[vec1_id];
+    const ValueMetadata& src2 = value_meta_[vec2_id];
+    if (src1.component_ranges.empty() && src2.component_ranges.empty())
+    {
+        return false;
+    }
+
+    ValueMetadata& dst = value_meta_[result_id];
+    dst.component_ranges.clear();
+
+    const Type& vec1_type = GetTypeByResultId(vec1_id);
+    const uint32_t vec1_width = vec1_type.vector.elem_count;
+
+    for (uint32_t literal_index = 5; literal_index < instruction.word_count; ++literal_index)
+    {
+        const uint32_t selector = instruction.words[literal_index];
+        if (selector == 0xFFFFFFFFu)
+        {
+            dst.component_ranges.push_back(DenseValueRangeInfo{});
+            continue;
+        }
+
+        const DenseValueRangeInfo* selected = nullptr;
+        if (selector < vec1_width)
+        {
+            if (selector < src1.component_ranges.size())
+            {
+                selected = &src1.component_ranges[selector];
+            }
+        }
+        else
+        {
+            const uint32_t c = selector - vec1_width;
+            if (c < src2.component_ranges.size())
+            {
+                selected = &src2.component_ranges[c];
+            }
+        }
+
+        if (selected != nullptr)
+        {
+            dst.component_ranges.push_back(*selected);
+        }
+        else
+        {
+            dst.component_ranges.push_back(DenseValueRangeInfo{});
+        }
+    }
+
+    return true;
+}
+
+void SPIRVSimulator::AppendSubobjectScalarRangesFromValue(std::vector<SubobjectScalarRangeEntry>& dst,
+                                                          const std::vector<uint32_t>& prefix,
+                                                          uint32_t source_id) const
+{
+    const ValueMetadata& src = value_meta_[source_id];
+    const Type& src_type = GetTypeByResultId(source_id);
+
+    // A scalar source becomes the leaf at the insertion prefix itself.
+    if ((src_type.kind == Type::Kind::BoolT || src_type.kind == Type::Kind::Int || src_type.kind == Type::Kind::Float) &&
+        src.value_range.valid)
+    {
+        dst.push_back(SubobjectScalarRangeEntry{ prefix, src.value_range });
+    }
+
+    // Vector component ranges become scalar leaves below the prefix.
+    for (uint32_t c = 0; c < src.component_ranges.size(); ++c)
+    {
+        if (!src.component_ranges[c].valid)
+        {
+            continue;
+        }
+        std::vector<uint32_t> path = prefix;
+        path.push_back(c);
+        dst.push_back(SubobjectScalarRangeEntry{ std::move(path), src.component_ranges[c] });
+    }
+
+    // Preserve nested aggregate leaves by prepending the insertion prefix.
+    for (const auto& entry : src.subobject_scalar_ranges)
+    {
+        std::vector<uint32_t> path = prefix;
+        path.insert(path.end(), entry.path.begin(), entry.path.end());
+        dst.push_back(SubobjectScalarRangeEntry{ std::move(path), entry.value_range });
+    }
+}
+
+bool SPIRVSimulator::PathStartsWith(const std::vector<uint32_t>& path,
+                                    const std::vector<uint32_t>& prefix) const
+{
+    if (prefix.size() > path.size())
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < prefix.size(); ++i)
+    {
+        if (path[i] != prefix[i])
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void SPIRVSimulator::EraseSubobjectScalarRangesByPrefix(std::vector<SubobjectScalarRangeEntry>& entries,
+                                                        const std::vector<uint32_t>& prefix) const
+{
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                 [&](const SubobjectScalarRangeEntry& entry) {
+                                     return PathStartsWith(entry.path, prefix);
+                                 }),
+                  entries.end());
+}
+
+StoredValueMetadataSnapshot SPIRVSimulator::MakeStoredValueMetadataSnapshot(uint32_t value_id) const
+{
+    const ValueMetadata& src = value_meta_[value_id];
+
+    StoredValueMetadataSnapshot out = {};
+    out.value_range = src.value_range;
+    out.component_ranges = src.component_ranges;
+    out.subobject_scalar_ranges = src.subobject_scalar_ranges;
+    out.address_range_valid = src.address_range_valid;
+    out.address_range_min = src.address_range_min;
+    out.address_range_max = src.address_range_max;
+    out.address_range_stride = src.address_range_stride;
+    out.address_element_size = src.address_element_size;
+    return out;
+}
+
+bool SPIRVSimulator::TryFindReachingStoreForPointer(const PointerV& pointer, uint32_t pointer_id, StoredValueRecord& out_record) const
+{
+    std::pair<std::byte*, uint64_t> resolved_pointer = ResolvePointerV(pointer);
+    PointerLocationKey key = MakePointerLocationKey(pointer, resolved_pointer.second);
+
+    auto by_location = values_stored_by_memory_location_.find(key);
+    if (by_location != values_stored_by_memory_location_.end())
+    {
+        out_record = by_location->second;
+        return true;
+    }
+
+    auto try_pointer_chain = [&](uint32_t start_id) -> bool {
+        uint32_t current_id = start_id;
+        uint32_t guard_count = 0;
+        while (current_id != 0 && guard_count++ < 32)
+        {
+            auto by_id = values_stored_.find(current_id);
+            if (by_id != values_stored_.end())
+            {
+                out_record = by_id->second;
+                return true;
+            }
+
+            const Value& current_value = GetValue(current_id);
+            if (!std::holds_alternative<PointerV>(current_value))
+            {
+                break;
+            }
+
+            const PointerV& current_pointer = std::get<PointerV>(current_value);
+            if (current_pointer.base_result_id == 0 || current_pointer.base_result_id == current_id)
+            {
+                break;
+            }
+
+            current_id = current_pointer.base_result_id;
+        }
+
+        return false;
+    };
+
+    if (pointer.base_result_id != 0 && try_pointer_chain(pointer.base_result_id))
+    {
+        return true;
+    }
+
+    if (try_pointer_chain(pointer_id))
+    {
+        return true;
+    }
+
+    return false;
+}
+
+bool SPIRVSimulator::TryComputeProjectionPath(const PointerV& target_pointer,
+                                              const PointerV& read_pointer,
+                                              std::vector<uint32_t>& out_suffix_path) const
+{
+    out_suffix_path.clear();
+
+    // Projection is only valid within the same pointer root, and the stored target
+    // cannot be deeper in the aggregate than the object being read.
+    if (target_pointer.storage_class != read_pointer.storage_class ||
+        target_pointer.pointer_handle != read_pointer.pointer_handle ||
+        target_pointer.base_type_id != read_pointer.base_type_id ||
+        target_pointer.base_result_id != read_pointer.base_result_id ||
+        target_pointer.idx_path.size() > read_pointer.idx_path.size())
+    {
+        return false;
+    }
+
+    // The stored target must be an ancestor of, or identical to, the read object.
+    for (size_t i = 0; i < target_pointer.idx_path.size(); ++i)
+    {
+        if (target_pointer.idx_path[i] != read_pointer.idx_path[i])
+        {
+            return false;
+        }
+    }
+
+    // The remaining indices describe how to project the stored metadata onto the
+    // subobject selected by the read pointer.
+    out_suffix_path.assign(read_pointer.idx_path.begin() + target_pointer.idx_path.size(), read_pointer.idx_path.end());
+    return true;
+}
+
+bool SPIRVSimulator::StoredTargetsOverlap(const PointerV& lhs, const PointerV& rhs) const
+{
+    std::vector<uint32_t> suffix_path;
+    return TryComputeProjectionPath(lhs, rhs, suffix_path) ||
+           TryComputeProjectionPath(rhs, lhs, suffix_path);
+}
+
+void SPIRVSimulator::InvalidateOverlappingStoredValues(const PointerV& stored_pointer)
+{
+    std::vector<uint32_t> stale_pointer_ids;
+    for (const auto& [pointer_id, record] : values_stored_)
+    {
+        if (StoredTargetsOverlap(stored_pointer, record.target_pointer))
+        {
+            stale_pointer_ids.push_back(pointer_id);
+        }
+    }
+    for (uint32_t pointer_id : stale_pointer_ids)
+    {
+        values_stored_.erase(pointer_id);
+    }
+
+    std::vector<PointerLocationKey> stale_locations;
+    for (const auto& [location, record] : values_stored_by_memory_location_)
+    {
+        if (StoredTargetsOverlap(stored_pointer, record.target_pointer))
+        {
+            stale_locations.push_back(location);
+        }
+    }
+    for (const PointerLocationKey& location : stale_locations)
+    {
+        values_stored_by_memory_location_.erase(location);
+    }
+}
+
+bool SPIRVSimulator::TryProjectAggregateSubobjectMetadata(uint32_t result_id,
+                                                          const std::vector<DenseValueRangeInfo>& source_component_ranges,
+                                                          const std::vector<SubobjectScalarRangeEntry>& source_subobject_ranges,
+                                                          const std::vector<uint32_t>& selected_path)
+{
+    ValueMetadata& result_meta = value_meta_[result_id];
+    const Type& result_type = GetTypeByResultId(result_id);
+
+    const bool result_is_scalar =
+        result_type.kind == Type::Kind::BoolT ||
+        result_type.kind == Type::Kind::Int ||
+        result_type.kind == Type::Kind::Float;
+
+    const bool result_is_aggregate =
+        result_type.kind == Type::Kind::Matrix ||
+        result_type.kind == Type::Kind::Array ||
+        result_type.kind == Type::Kind::RuntimeArray ||
+        result_type.kind == Type::Kind::Struct;
+
+    // First handle a direct vector component using the compact component
+    // metadata representation.
+    if (result_is_scalar && selected_path.size() == 1)
+    {
+        const uint32_t component_index = selected_path[0];
+        if (component_index < source_component_ranges.size() &&
+            source_component_ranges[component_index].valid)
+        {
+            result_meta.value_range = source_component_ranges[component_index];
+            return true;
+        }
+    }
+
+    bool projected = false;
+
+    for (const SubobjectScalarRangeEntry& entry : source_subobject_ranges)
+    {
+        if (!entry.value_range.valid)
+        {
+            continue;
+        }
+
+        // Ignore scalar leaves outside the selected source subtree.
+        if (!PathStartsWith(entry.path, selected_path))
+        {
+            continue;
+        }
+
+        std::vector<uint32_t> relative_path(entry.path.begin() + selected_path.size(), entry.path.end());
+
+        if (relative_path.empty())
+        {
+            if (!result_is_scalar)
+            {
+                // Defensive fallback for inconsistent source metadata.
+                continue;
+            }
+
+            // Exact scalar leaf projection.
+            result_meta.value_range = entry.value_range;
+            return true;
+        }
+
+        if (result_is_scalar)
+        {
+            // Defensive fallback: a scalar result cannot have descendants.
+            continue;
+        }
+
+        if (result_type.kind == Type::Kind::Vector)
+        {
+            if (relative_path.size() != 1)
+            {
+                // A vector component must be a direct scalar leaf.
+                continue;
+            }
+
+            const uint32_t component_index = relative_path[0];
+            if (component_index >= result_type.vector.elem_count)
+            {
+                // Malformed or inconsistent metadata must not be published.
+                continue;
+            }
+
+            if (result_meta.component_ranges.size() < result_type.vector.elem_count)
+            {
+                result_meta.component_ranges.resize(result_type.vector.elem_count);
+            }
+
+            result_meta.component_ranges[component_index] = entry.value_range;
+            projected = true;
+            // One entry describes only one component of vector; keep collecting siblings if have.
+            continue;
+        }
+
+        if (!result_is_aggregate)
+        {
+            // Defensive fallback for unsupported or inconsistent result kinds.
+            continue;
+        }
+
+        // Preserve nested scalar leaves relative to the new aggregate root.
+        result_meta.subobject_scalar_ranges.push_back(
+            SubobjectScalarRangeEntry{ std::move(relative_path), entry.value_range });
+        projected = true;
+    }
+
+    return projected;
+}
+
 bool SPIRVSimulator::TrySetComputeBuiltinValueAndRange(uint32_t result_id, const PointerV& pointer, uint32_t type_id)
 {
     if (pointer.storage_class != spv::StorageClass::StorageClassInput || pointer.base_result_id == 0)
     {
         return false;
     }
-    if (!HasDecorator(pointer.base_result_id, spv::Decoration::DecorationBuiltIn))
+    if (!HasDecorator(pointer.base_result_id, spv::Decoration::DecorationBuiltIn) ||
+        !simulation_data_->has_compute_num_workgroups)
     {
         return false;
     }
@@ -3373,6 +3761,9 @@ bool SPIRVSimulator::TrySetComputeBuiltinValueAndRange(uint32_t result_id, const
     spv::BuiltIn builtin = static_cast<spv::BuiltIn>(GetDecoratorLiteral(pointer.base_result_id, spv::Decoration::DecorationBuiltIn));
     const Type& result_type = GetTypeByTypeId(type_id);
 
+    const uint64_t base_x = simulation_data_->base_workgroups.x;
+    const uint64_t base_y = simulation_data_->base_workgroups.y;
+    const uint64_t base_z = simulation_data_->base_workgroups.z;
     const uint64_t nx = std::max<uint64_t>(simulation_data_->compute_num_workgroups.x, 1);
     const uint64_t ny = std::max<uint64_t>(simulation_data_->compute_num_workgroups.y, 1);
     const uint64_t nz = std::max<uint64_t>(simulation_data_->compute_num_workgroups.z, 1);
@@ -3391,23 +3782,23 @@ bool SPIRVSimulator::TrySetComputeBuiltinValueAndRange(uint32_t result_id, const
     auto set_scalar_range = [&](uint64_t min_val, uint64_t max_val) {
         ValueMetadata& meta = value_meta_[result_id];
         meta.flags |= SPS_FLAG_THREAD_SPECIFIC;
-        meta.range_valid = true;
-        meta.thread_dependent = true;
-        meta.dense_range = true;
-        meta.range_min = min_val;
-        meta.range_max = max_val;
-        meta.range_stride = 1;
+        meta.value_range = DenseValueRangeInfo{ true, true, true, min_val, max_val, 1 };
     };
 
     auto set_vector_linear_range = [&](uint64_t max_linear) {
         ValueMetadata& meta = value_meta_[result_id];
         meta.flags |= SPS_FLAG_THREAD_SPECIFIC;
-        meta.range_valid = true;
-        meta.thread_dependent = true;
-        meta.dense_range = true;
-        meta.range_min = 0;
-        meta.range_max = max_linear;
-        meta.range_stride = 1;
+        meta.value_range = DenseValueRangeInfo{ true, true, true, 0, max_linear, 1 };
+    };
+
+    auto set_component_ranges = [&](std::initializer_list<std::pair<uint64_t, uint64_t>> ranges) {
+        ValueMetadata& meta = value_meta_[result_id];
+        meta.flags |= SPS_FLAG_THREAD_SPECIFIC;
+        meta.component_ranges.clear();
+        for (const auto& range : ranges)
+        {
+            meta.component_ranges.push_back(DenseValueRangeInfo{ true, true, true, range.first, range.second, 1 });
+        }
     };
 
     switch (builtin)
@@ -3415,28 +3806,64 @@ bool SPIRVSimulator::TrySetComputeBuiltinValueAndRange(uint32_t result_id, const
         case spv::BuiltIn::BuiltInWorkgroupId:
             if (result_type.kind == Type::Kind::Vector)
             {
-                SetValue(result_id, make_uvec3(0, 0, 0));
+                SetValue(result_id, make_uvec3(base_x, base_y, base_z));
+                set_component_ranges({
+                    { base_x, base_x + nx - 1 },
+                    { base_y, base_y + ny - 1 },
+                    { base_z, base_z + nz - 1 },
+                });
                 set_vector_linear_range(SaturatingMul64(SaturatingMul64(nx, ny), nz) - 1);
                 return true;
+            }
+            if (result_type.kind == Type::Kind::Int && pointer.idx_path.size() == 1)
+            {
+                const uint32_t c = pointer.idx_path[0];
+                if (c == 0) { SetValue(result_id, uint64_t(base_x)); set_scalar_range(base_x, base_x + nx - 1); return true; }
+                if (c == 1) { SetValue(result_id, uint64_t(base_y)); set_scalar_range(base_y, base_y + ny - 1); return true; }
+                if (c == 2) { SetValue(result_id, uint64_t(base_z)); set_scalar_range(base_z, base_z + nz - 1); return true; }
             }
             break;
         case spv::BuiltIn::BuiltInLocalInvocationId:
             if (result_type.kind == Type::Kind::Vector)
             {
                 SetValue(result_id, make_uvec3(0, 0, 0));
+                set_component_ranges({
+                    { 0, lx - 1 },
+                    { 0, ly - 1 },
+                    { 0, lz - 1 },
+                });
                 set_vector_linear_range(SaturatingMul64(SaturatingMul64(lx, ly), lz) - 1);
                 return true;
+            }
+            if (result_type.kind == Type::Kind::Int && pointer.idx_path.size() == 1)
+            {
+                const uint32_t c = pointer.idx_path[0];
+                if (c == 0) { SetValue(result_id, uint64_t(0)); set_scalar_range(0, lx - 1); return true; }
+                if (c == 1) { SetValue(result_id, uint64_t(0)); set_scalar_range(0, ly - 1); return true; }
+                if (c == 2) { SetValue(result_id, uint64_t(0)); set_scalar_range(0, lz - 1); return true; }
             }
             break;
         case spv::BuiltIn::BuiltInGlobalInvocationId:
             if (result_type.kind == Type::Kind::Vector)
             {
-                SetValue(result_id, make_uvec3(0, 0, 0));
+                SetValue(result_id, make_uvec3(SaturatingMul64(base_x, lx), SaturatingMul64(base_y, ly), SaturatingMul64(base_z, lz)));
+                set_component_ranges({
+                    { SaturatingMul64(base_x, lx), SaturatingMul64(base_x + nx, lx) - 1 },
+                    { SaturatingMul64(base_y, ly), SaturatingMul64(base_y + ny, ly) - 1 },
+                    { SaturatingMul64(base_z, lz), SaturatingMul64(base_z + nz, lz) - 1 },
+                });
                 const uint64_t gx = SaturatingMul64(nx, lx);
                 const uint64_t gy = SaturatingMul64(ny, ly);
                 const uint64_t gz = SaturatingMul64(nz, lz);
                 set_vector_linear_range(SaturatingMul64(SaturatingMul64(gx, gy), gz) - 1);
                 return true;
+            }
+            if (result_type.kind == Type::Kind::Int && pointer.idx_path.size() == 1)
+            {
+                const uint32_t c = pointer.idx_path[0];
+                if (c == 0) { uint64_t min_v = SaturatingMul64(base_x, lx); SetValue(result_id, min_v); set_scalar_range(min_v, SaturatingMul64(base_x + nx, lx) - 1); return true; }
+                if (c == 1) { uint64_t min_v = SaturatingMul64(base_y, ly); SetValue(result_id, min_v); set_scalar_range(min_v, SaturatingMul64(base_y + ny, ly) - 1); return true; }
+                if (c == 2) { uint64_t min_v = SaturatingMul64(base_z, lz); SetValue(result_id, min_v); set_scalar_range(min_v, SaturatingMul64(base_z + nz, lz) - 1); return true; }
             }
             break;
         case spv::BuiltIn::BuiltInLocalInvocationIndex:
@@ -3457,7 +3884,9 @@ void SPIRVSimulator::PropagateBinaryRangeAdd(uint32_t result_id, uint32_t lhs_id
 {
     const ValueMetadata& a = value_meta_[lhs_id];
     const ValueMetadata& b = value_meta_[rhs_id];
-    if (!a.range_valid && !b.range_valid)
+    const DenseValueRangeInfo& a_range = a.value_range;
+    const DenseValueRangeInfo& b_range = b.value_range;
+    if (!a_range.valid && !b_range.valid)
     {
         return;
     }
@@ -3467,26 +3896,30 @@ void SPIRVSimulator::PropagateBinaryRangeAdd(uint32_t result_id, uint32_t lhs_id
         return;
     }
 
-    uint64_t a_min = a.range_valid ? a.range_min : GetUIntScalarValue(lhs_id);
-    uint64_t a_max = a.range_valid ? a.range_max : a_min;
-    uint64_t b_min = b.range_valid ? b.range_min : GetUIntScalarValue(rhs_id);
-    uint64_t b_max = b.range_valid ? b.range_max : b_min;
+    uint64_t a_min = a_range.valid ? a_range.min : GetUIntScalarValue(lhs_id);
+    uint64_t a_max = a_range.valid ? a_range.max : a_min;
+    uint64_t b_min = b_range.valid ? b_range.min : GetUIntScalarValue(rhs_id);
+    uint64_t b_max = b_range.valid ? b_range.max : b_min;
 
     ValueMetadata& out = value_meta_[result_id];
     out.flags |= SPS_FLAG_THREAD_SPECIFIC;
-    out.range_valid = true;
-    out.thread_dependent = a.thread_dependent || b.thread_dependent;
-    out.dense_range = (a.dense_range || !a.range_valid) && (b.dense_range || !b.range_valid);
-    out.range_min = a_min + b_min;
-    out.range_max = a_max + b_max;
-    out.range_stride = std::max<uint64_t>(a.range_valid ? a.range_stride : 1, b.range_valid ? b.range_stride : 1);
+    out.value_range = DenseValueRangeInfo{
+        true,
+        a_range.thread_dependent || b_range.thread_dependent,
+        (a_range.dense_range || !a_range.valid) && (b_range.dense_range || !b_range.valid),
+        a_min + b_min,
+        a_max + b_max,
+        std::max<uint64_t>(a_range.valid ? a_range.stride : 1, b_range.valid ? b_range.stride : 1),
+    };
 }
 
 void SPIRVSimulator::PropagateBinaryRangeSub(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id)
 {
     const ValueMetadata& a = value_meta_[lhs_id];
     const ValueMetadata& b = value_meta_[rhs_id];
-    if (!a.range_valid && !b.range_valid)
+    const DenseValueRangeInfo& a_range = a.value_range;
+    const DenseValueRangeInfo& b_range = b.value_range;
+    if (!a_range.valid && !b_range.valid)
     {
         return;
     }
@@ -3496,10 +3929,10 @@ void SPIRVSimulator::PropagateBinaryRangeSub(uint32_t result_id, uint32_t lhs_id
         return;
     }
 
-    uint64_t a_min = a.range_valid ? a.range_min : GetUIntScalarValue(lhs_id);
-    uint64_t a_max = a.range_valid ? a.range_max : a_min;
-    uint64_t b_min = b.range_valid ? b.range_min : GetUIntScalarValue(rhs_id);
-    uint64_t b_max = b.range_valid ? b.range_max : b_min;
+    uint64_t a_min = a_range.valid ? a_range.min : GetUIntScalarValue(lhs_id);
+    uint64_t a_max = a_range.valid ? a_range.max : a_min;
+    uint64_t b_min = b_range.valid ? b_range.min : GetUIntScalarValue(rhs_id);
+    uint64_t b_max = b_range.valid ? b_range.max : b_min;
 
     if (a_min < b_max)
     {
@@ -3508,19 +3941,23 @@ void SPIRVSimulator::PropagateBinaryRangeSub(uint32_t result_id, uint32_t lhs_id
 
     ValueMetadata& out = value_meta_[result_id];
     out.flags |= SPS_FLAG_THREAD_SPECIFIC;
-    out.range_valid = true;
-    out.thread_dependent = a.thread_dependent || b.thread_dependent;
-    out.dense_range = (a.dense_range || !a.range_valid) && (b.dense_range || !b.range_valid);
-    out.range_min = a_min - b_max;
-    out.range_max = a_max - b_min;
-    out.range_stride = std::max<uint64_t>(a.range_valid ? a.range_stride : 1, b.range_valid ? b.range_stride : 1);
+    out.value_range = DenseValueRangeInfo{
+        true,
+        a_range.thread_dependent || b_range.thread_dependent,
+        (a_range.dense_range || !a_range.valid) && (b_range.dense_range || !b_range.valid),
+        a_min - b_max,
+        a_max - b_min,
+        std::max<uint64_t>(a_range.valid ? a_range.stride : 1, b_range.valid ? b_range.stride : 1),
+    };
 }
 
 void SPIRVSimulator::PropagateBinaryRangeMul(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id)
 {
     const ValueMetadata& a = value_meta_[lhs_id];
     const ValueMetadata& b = value_meta_[rhs_id];
-    if (!a.range_valid && !b.range_valid)
+    const DenseValueRangeInfo& a_range = a.value_range;
+    const DenseValueRangeInfo& b_range = b.value_range;
+    if (!a_range.valid && !b_range.valid)
     {
         return;
     }
@@ -3530,39 +3967,44 @@ void SPIRVSimulator::PropagateBinaryRangeMul(uint32_t result_id, uint32_t lhs_id
         return;
     }
 
-    uint64_t a_min = a.range_valid ? a.range_min : GetUIntScalarValue(lhs_id);
-    uint64_t a_max = a.range_valid ? a.range_max : a_min;
-    uint64_t b_min = b.range_valid ? b.range_min : GetUIntScalarValue(rhs_id);
-    uint64_t b_max = b.range_valid ? b.range_max : b_min;
+    uint64_t a_min = a_range.valid ? a_range.min : GetUIntScalarValue(lhs_id);
+    uint64_t a_max = a_range.valid ? a_range.max : a_min;
+    uint64_t b_min = b_range.valid ? b_range.min : GetUIntScalarValue(rhs_id);
+    uint64_t b_max = b_range.valid ? b_range.max : b_min;
 
-    ValueMetadata& out = value_meta_[result_id];
-    out.flags |= SPS_FLAG_THREAD_SPECIFIC;
-    out.range_valid = true;
-    out.thread_dependent = a.thread_dependent || b.thread_dependent;
-    out.dense_range = false;
-    out.range_min = SaturatingMul64(a_min, b_min);
-    out.range_max = SaturatingMul64(a_max, b_max);
-    if (a.range_valid && !b.range_valid)
+    DenseValueRangeInfo out_range = {};
+    out_range.valid = true;
+    out_range.thread_dependent = a_range.thread_dependent || b_range.thread_dependent;
+    out_range.dense_range = false;
+    out_range.min = SaturatingMul64(a_min, b_min);
+    out_range.max = SaturatingMul64(a_max, b_max);
+    if (a_range.valid && !b_range.valid)
     {
-        out.range_stride = a.range_stride * std::max<uint64_t>(b_min, 1);
-        out.dense_range = a.dense_range && (b_min == 1 || a.range_stride == 1);
+        out_range.stride = a_range.stride * std::max<uint64_t>(b_min, 1);
+        out_range.dense_range = a_range.dense_range && (b_min == 1 || a_range.stride == 1);
     }
-    else if (!a.range_valid && b.range_valid)
+    else if (!a_range.valid && b_range.valid)
     {
-        out.range_stride = b.range_stride * std::max<uint64_t>(a_min, 1);
-        out.dense_range = b.dense_range && (a_min == 1 || b.range_stride == 1);
+        out_range.stride = b_range.stride * std::max<uint64_t>(a_min, 1);
+        out_range.dense_range = b_range.dense_range && (a_min == 1 || b_range.stride == 1);
     }
     else
     {
-        out.range_stride = std::max<uint64_t>(a.range_stride, b.range_stride);
+        out_range.stride = std::max<uint64_t>(a_range.stride, b_range.stride);
     }
+
+    ValueMetadata& out = value_meta_[result_id];
+    out.flags |= SPS_FLAG_THREAD_SPECIFIC;
+    out.value_range = out_range;
 }
 
 void SPIRVSimulator::PropagateBinaryRangeDiv(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id)
 {
     const ValueMetadata& a = value_meta_[lhs_id];
     const ValueMetadata& b = value_meta_[rhs_id];
-    if (!a.range_valid || b.range_valid)
+    const DenseValueRangeInfo& a_range = a.value_range;
+    const DenseValueRangeInfo& b_range = b.value_range;
+    if (!a_range.valid || b_range.valid)
     {
         return;
     }
@@ -3575,21 +4017,26 @@ void SPIRVSimulator::PropagateBinaryRangeDiv(uint32_t result_id, uint32_t lhs_id
     {
         return;
     }
+
     ValueMetadata& out = value_meta_[result_id];
     out.flags |= SPS_FLAG_THREAD_SPECIFIC;
-    out.range_valid = true;
-    out.thread_dependent = a.thread_dependent;
-    out.dense_range = false;
-    out.range_min = a.range_min / divisor;
-    out.range_max = a.range_max / divisor;
-    out.range_stride = 1;
+    out.value_range = DenseValueRangeInfo{
+        true,
+        a_range.thread_dependent,
+        false,
+        a_range.min / divisor,
+        a_range.max / divisor,
+        1,
+    };
 }
 
 void SPIRVSimulator::PropagateBinaryRangeMod(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id)
 {
     const ValueMetadata& a = value_meta_[lhs_id];
     const ValueMetadata& b = value_meta_[rhs_id];
-    if (!a.range_valid || b.range_valid)
+    const DenseValueRangeInfo& a_range = a.value_range;
+    const DenseValueRangeInfo& b_range = b.value_range;
+    if (!a_range.valid || b_range.valid)
     {
         return;
     }
@@ -3602,14 +4049,17 @@ void SPIRVSimulator::PropagateBinaryRangeMod(uint32_t result_id, uint32_t lhs_id
     {
         return;
     }
+
     ValueMetadata& out = value_meta_[result_id];
     out.flags |= SPS_FLAG_THREAD_SPECIFIC;
-    out.range_valid = true;
-    out.thread_dependent = a.thread_dependent;
-    out.dense_range = false;
-    out.range_min = 0;
-    out.range_max = mod - 1;
-    out.range_stride = 1;
+    out.value_range = DenseValueRangeInfo{
+        true,
+        a_range.thread_dependent,
+        false,
+        0,
+        mod - 1,
+        1,
+    };
 }
 
 bool SPIRVSimulator::TryGetDenseStoreRange(const PointerV& pointer, uint32_t pointer_id, uint32_t result_id, uint64_t& dst_start, uint64_t& byte_size, uint64_t& element_size)
@@ -3624,14 +4074,9 @@ bool SPIRVSimulator::TryGetDenseStoreRange(const PointerV& pointer, uint32_t poi
         return false;
     }
 
-    element_size = GetBitsizeOfType(GetTargetPointerType(pointer)) / 8;
-    if (element_size == 0)
-    {
-        return false;
-    }
-
     const ValueMetadata& ptr_meta = value_meta_[pointer_id];
-    if (ptr_meta.address_range_stride != element_size)
+    element_size = ptr_meta.address_element_size;
+    if (element_size == 0 || ptr_meta.address_range_stride != element_size)
     {
         return false;
     }
@@ -3649,13 +4094,305 @@ bool SPIRVSimulator::TryGetDenseStoreRange(const PointerV& pointer, uint32_t poi
     {
         return false;
     }
-    byte_size = (last - dst_start) + element_size;
+    const uint64_t address_span = last - dst_start;
+    if (address_span > std::numeric_limits<uint64_t>::max() - element_size)
+    {
+        return false;
+    }
+    byte_size = address_span + element_size;
     if ((byte_size % element_size) != 0)
     {
         return false;
     }
 
     (void)result_id;
+    return true;
+}
+
+bool SPIRVSimulator::TrySetDenseAccessChainAddressRange(const Instruction& instruction,
+                                                        const PointerV& result_pointer)
+{
+    assert(instruction.opcode == spv::Op::OpAccessChain ||
+           instruction.opcode == spv::Op::OpInBoundsAccessChain);
+
+    const uint32_t result_type_id = instruction.words[1];
+    const uint32_t result_id      = instruction.words[2];
+    const uint32_t base_id        = instruction.words[3];
+    const Type&    result_type    = GetTypeByTypeId(result_type_id);
+
+    ValueMetadata& out_meta = value_meta_[result_id];
+    out_meta.address_range_valid  = false;
+    out_meta.address_range_min    = 0;
+    out_meta.address_range_max    = 0;
+    out_meta.address_range_stride = 1;
+    out_meta.address_element_size = 0;
+
+    if (instruction.word_count <= 4 || result_type.kind != Type::Kind::Pointer)
+    {
+        return false;
+    }
+
+    // Build a range only when the final index is thread-dependent and all
+    // preceding indexes are fixed. The current metadata represents one dense
+    // sequence and cannot combine multiple dynamic address contributions.
+
+    // Pre-existing base-pointer ranges, thread-dependent non-final indexes,
+    // descriptor-array indirection, thread-dependent matrix indexing, vector or
+    // composite result pointees, and padded final elements are rejected.
+
+    // TODO: Before accepting vector/composite pointees or non-final dynamic
+    // indexes, extend the metadata and promotion model, carry matrix layout
+    // context through memory I/O, and then combine per-level index contributions.
+
+    const uint32_t final_operand_index = instruction.word_count - 1;
+    bool has_thread_dependent_non_final_index = false;
+
+    // Preserve any detected thread dependency when range construction is rejected.
+    for (uint32_t operand_index = 4; operand_index < instruction.word_count; ++operand_index)
+    {
+        const uint32_t             index_id    = instruction.words[operand_index];
+        const DenseValueRangeInfo& index_range = value_meta_[index_id].value_range;
+        if (ValueIsThreadSpecific(index_id) ||
+            (index_range.valid && index_range.thread_dependent))
+        {
+            out_meta.flags |= SPS_FLAG_THREAD_SPECIFIC;
+            has_thread_dependent_non_final_index = operand_index < final_operand_index;
+            break;
+        }
+    }
+
+    // Do not combine an existing base-pointer range with a new dynamic index.
+    if (value_meta_[base_id].address_range_valid || ValueIsThreadSpecific(base_id))
+    {
+        return false;
+    }
+
+    // All indexes before the final index must be fixed value.
+    if (has_thread_dependent_non_final_index)
+    {
+        return false;
+    }
+
+    const uint32_t final_index_id = instruction.words[final_operand_index];
+    const DenseValueRangeInfo& final_index_range = value_meta_[final_index_id].value_range;
+    if (!final_index_range.valid || !final_index_range.thread_dependent || !final_index_range.dense_range)
+    {
+        return false;
+    }
+
+    if (final_index_range.stride == 0 || final_index_range.max < final_index_range.min)
+    {
+        return false;
+    }
+
+    const uint64_t index_span = final_index_range.max - final_index_range.min;
+    // The inclusive maximum must be reachable from min by whole stride steps.
+    if ((index_span % final_index_range.stride) != 0)
+    {
+        return false;
+    }
+
+    // DenseValueRangeInfo stores uint64_t values, but PointerV::idx_path stores uint32_t indexes.
+    // Reject values that would be truncated when constructing the min and max pointers.
+    if (final_index_range.min > std::numeric_limits<uint32_t>::max() ||
+        final_index_range.max > std::numeric_limits<uint32_t>::max())
+    {
+        return false;
+    }
+
+    // Find the container type indexed by the final index.
+    PointerV final_index_container_pointer = result_pointer;
+    if (final_index_container_pointer.idx_path.empty())
+    {
+        return false;
+    }
+    final_index_container_pointer.idx_path.pop_back();
+
+    const Type& final_index_container_type =
+        GetTypeByTypeId(GetTargetPointerType(final_index_container_pointer));
+    if (final_index_container_type.kind != Type::Kind::Vector &&
+        final_index_container_type.kind != Type::Kind::Array &&
+        final_index_container_type.kind != Type::Kind::RuntimeArray)
+    {
+        return false;
+    }
+
+    // TODO: Validate final_index_range against fixed Array and Vector bounds before
+    // resolving addresses. The global index range may exceed the in-bounds indexes
+    // that reach this access and extend the resulting address range past the object.
+
+    // A top-level descriptor-array index may select a different allocation and
+    // therefore cannot be represented as offsets from one backing pointer.
+    if (result_pointer.idx_path.size() == 1 &&
+        (result_pointer.storage_class == spv::StorageClass::StorageClassUniform ||
+         result_pointer.storage_class == spv::StorageClass::StorageClassUniformConstant ||
+         result_pointer.storage_class == spv::StorageClass::StorageClassStorageBuffer) &&
+        (final_index_container_type.kind == Type::Kind::Array ||
+         final_index_container_type.kind == Type::Kind::RuntimeArray))
+    {
+        return false;
+    }
+
+    // The final result pointee must be a scalar or pointer. Vector and composite
+    // pointees require metadata that can represent their internal value semantics.
+    const uint32_t result_pointee_type_id = result_type.pointer.pointee_type_id;
+    const Type& result_pointee_type = GetTypeByTypeId(result_pointee_type_id);
+    if (result_pointee_type.kind != Type::Kind::Int &&
+        result_pointee_type.kind != Type::Kind::Float &&
+        result_pointee_type.kind != Type::Kind::Pointer)
+    {
+        return false;
+    }
+
+    const uint64_t result_pointee_bit_size = GetBitsizeOfType(result_pointee_type_id);
+    if (result_pointee_bit_size == 0 || (result_pointee_bit_size % 8) != 0)
+    {
+        return false;
+    }
+    const uint64_t element_size = result_pointee_bit_size / 8;
+
+    const size_t final_path_position = result_pointer.idx_path.size() - 1;
+    // Resolve the first and last element addresses using the actual pointer layout.
+    PointerV min_pointer = result_pointer;
+    PointerV max_pointer = result_pointer;
+    min_pointer.idx_path[final_path_position] = static_cast<uint32_t>(final_index_range.min);
+    max_pointer.idx_path[final_path_position] = static_cast<uint32_t>(final_index_range.max);
+
+    const std::pair<std::byte*, uint64_t> min_resolved = ResolvePointerV(min_pointer);
+    const std::pair<std::byte*, uint64_t> max_resolved = ResolvePointerV(max_pointer);
+    // Different base pointers mean that the indexes selected different backing
+    // allocations, so the addresses cannot form one linear range.
+    if (min_resolved.first == nullptr ||
+        max_resolved.first == nullptr ||
+        min_resolved.first != max_resolved.first)
+    {
+        return false;
+    }
+
+    const uint64_t base_address = bit_cast<uint64_t>(min_resolved.first);
+    if (min_resolved.second > std::numeric_limits<uint64_t>::max() - base_address ||
+        max_resolved.second > std::numeric_limits<uint64_t>::max() - base_address)
+    {
+        return false;
+    }
+
+    const uint64_t min_address = base_address + min_resolved.second;
+    const uint64_t max_address = base_address + max_resolved.second;
+    if (max_address < min_address)
+    {
+        return false;
+    }
+
+    // A single selected element has no second address from which to derive the
+    // stride, so its scalar or pointer element size is the byte stride.
+    uint64_t byte_stride = element_size;
+
+    // For a multi-element range, resolve the next reachable index to derive the real byte stride.
+    if (index_span != 0)
+    {
+        const uint64_t next_index = final_index_range.min + final_index_range.stride;
+        PointerV next_pointer = result_pointer;
+        next_pointer.idx_path[final_path_position] = static_cast<uint32_t>(next_index);
+
+        const std::pair<std::byte*, uint64_t> next_resolved = ResolvePointerV(next_pointer);
+        if (next_resolved.first == nullptr ||
+            next_resolved.first != min_resolved.first ||
+            next_resolved.second > std::numeric_limits<uint64_t>::max() - base_address)
+        {
+            return false;
+        }
+
+        const uint64_t next_address = base_address + next_resolved.second;
+        if (next_address <= min_address)
+        {
+            return false;
+        }
+        byte_stride = next_address - min_address;
+
+        const uint64_t step_count = index_span / final_index_range.stride;
+        if (byte_stride > std::numeric_limits<uint64_t>::max() / step_count ||
+            min_address > std::numeric_limits<uint64_t>::max() - (byte_stride * step_count))
+        {
+            return false;
+        }
+        const uint64_t address_span = byte_stride * step_count;
+        if (max_address != min_address + address_span)
+        {
+            return false;
+        }
+    }
+
+    // Only tightly packed final elements can form a dense address range.
+    if (byte_stride != element_size)
+    {
+        // TODO: Support strided and padded address ranges.
+        return false;
+    }
+
+    // address_range_max is the start address of the final element.
+    out_meta.flags |= SPS_FLAG_THREAD_SPECIFIC;
+    out_meta.address_range_valid  = true;
+    out_meta.address_range_min    = min_address;
+    out_meta.address_range_max    = max_address;
+    out_meta.address_range_stride = byte_stride;
+    out_meta.address_element_size = element_size;
+    return true;
+}
+
+bool SPIRVSimulator::TryQueueDenseReadSidePbufferPointers(const Instruction& instruction,
+                                                          uint32_t           result_id,
+                                                          const PointerV&    representative_slot_pointer)
+{
+    assert(instruction.opcode == spv::Op::OpAccessChain || instruction.opcode == spv::Op::OpInBoundsAccessChain);
+
+    const ValueMetadata& result_meta = value_meta_[result_id];
+    assert(result_meta.address_range_valid);
+    assert(result_meta.address_range_stride != 0);
+    assert(result_meta.address_range_max >= result_meta.address_range_min);
+    assert(result_meta.address_range_stride == result_meta.address_element_size);
+    assert(!representative_slot_pointer.idx_path.empty());
+
+    const uint32_t             final_index_id    = instruction.words[instruction.word_count - 1];
+    const DenseValueRangeInfo& final_index_range = value_meta_[final_index_id].value_range;
+    assert(final_index_range.valid);
+    assert(final_index_range.thread_dependent);
+    assert(final_index_range.dense_range);
+    assert(final_index_range.stride != 0);
+    assert(final_index_range.max >= final_index_range.min);
+
+    const uint64_t address_span = result_meta.address_range_max - result_meta.address_range_min;
+    assert((address_span % result_meta.address_range_stride) == 0);
+
+    const uint64_t slot_count = (address_span / result_meta.address_range_stride) + 1;
+    // Bound one expansion so a valid but very large range cannot consume excessive time and memory.
+    // Returning false lets Op_AccessChain preserve the representative pair and report incomplete coverage.
+    if (slot_count > kMaxDenseReadSidePointerSlots)
+    {
+        return false;
+    }
+
+    std::vector<std::pair<PointerV, PointerV>> pending_pairs;
+    pending_pairs.reserve(static_cast<size_t>(slot_count));
+
+    const size_t final_path_position = representative_slot_pointer.idx_path.size() - 1;
+    for (uint64_t step = 0; step < slot_count; ++step)
+    {
+        const uint64_t logical_index = final_index_range.min + (step * final_index_range.stride);
+
+        PointerV slot_pointer                      = representative_slot_pointer;
+        slot_pointer.idx_path[final_path_position] = static_cast<uint32_t>(logical_index);
+
+        const std::optional<Value> loaded_value = ReadPointer(slot_pointer);
+        if (!loaded_value || !std::holds_alternative<PointerV>(*loaded_value))
+        {
+            return false;
+        }
+
+        pending_pairs.emplace_back(slot_pointer, std::get<PointerV>(*loaded_value));
+    }
+
+    pointers_to_physical_address_pointers_.insert(
+        pointers_to_physical_address_pointers_.end(), pending_pairs.begin(), pending_pairs.end());
     return true;
 }
 
@@ -4102,30 +4839,31 @@ std::vector<DataSourceBits> SPIRVSimulator::FindDataSourcesFromResultIDImpl(
                 PointerLocationKey key = MakePointerLocationKey(pointer, resolved_ptr.second);
 
                 auto by_location = values_stored_by_memory_location_.find(key);
-                if (by_location != values_stored_by_memory_location_.end() && by_location->second != result_id)
+                if (by_location != values_stored_by_memory_location_.end() &&
+                    by_location->second.stored_result_id != result_id)
                 {
                     if (verbose_)
                     {
                         std::cout << execIndent << execIndent
                                   << "Following load/store indirection by memory location to: "
-                                  << by_location->second << std::endl;
+                                  << by_location->second.stored_result_id << std::endl;
                     }
-                    trace_id(by_location->second);
+                    trace_id(by_location->second.stored_result_id);
                     break;
                 }
 
                 // Fallback to exact SSA pointer ID if the location was not
                 // seen. This still covers unresolvable/opaque pointer cases.
                 auto by_id = values_stored_.find(pointer_id);
-                if (by_id != values_stored_.end() && by_id->second != result_id)
+                if (by_id != values_stored_.end() && by_id->second.stored_result_id != result_id)
                 {
                     if (verbose_)
                     {
                         std::cout << execIndent << execIndent
                                   << "Following load/store indirection by pointer id to: "
-                                  << by_id->second << std::endl;
+                                  << by_id->second.stored_result_id << std::endl;
                     }
-                    trace_id(by_id->second);
+                    trace_id(by_id->second.stored_result_id);
                     break;
                 }
 
@@ -7719,27 +8457,54 @@ void SPIRVSimulator::Op_CompositeConstruct(const Instruction& instruction)
     {
         auto vec = std::make_shared<VectorV>();
         vec->elems.reserve(type.vector.elem_count);
-        for (auto i = 3; i < instruction.word_count; ++i)
+
+        std::vector<DenseValueRangeInfo> component_ranges;
+        component_ranges.reserve(type.vector.elem_count);
+
+        for (uint32_t i = 3; i < instruction.word_count; ++i)
         {
-            const Value& component_value = GetValue(instruction.words[i]);
-            ExtractFlags(instruction.words[i], value_meta);
+            const uint32_t operand_id = instruction.words[i];
+            const Value& component_value = GetValue(operand_id);
+            const Type& component_type = GetTypeByResultId(operand_id);
+            const ValueMetadata& src_meta = value_meta_[operand_id];
+            ExtractFlags(operand_id, value_meta);
 
             if (std::holds_alternative<std::shared_ptr<VectorV>>(component_value))
             {
                 std::shared_ptr<VectorV> component_vector = std::get<std::shared_ptr<VectorV>>(component_value);
+                assert(component_type.kind == Type::Kind::Vector);
+                assert(component_vector->elems.size() == component_type.vector.elem_count);
 
-                for (const auto& vec_component : component_vector->elems)
+                for (uint32_t c = 0; c < component_type.vector.elem_count; ++c)
                 {
-                    vec->elems.push_back(vec_component);
+                    vec->elems.push_back(component_vector->elems[c]);
+
+                    if (c < src_meta.component_ranges.size())
+                    {
+                        component_ranges.push_back(src_meta.component_ranges[c]);
+                    }
+                    else
+                    {
+                        component_ranges.push_back(DenseValueRangeInfo{});
+                    }
                 }
             }
             else
             {
                 vec->elems.push_back(component_value);
+                if (src_meta.value_range.valid)
+                {
+                    component_ranges.push_back(src_meta.value_range);
+                }
+                else
+                {
+                    component_ranges.push_back(DenseValueRangeInfo{});
+                }
             }
         }
 
         SetValue(result_id, vec);
+        value_meta_[result_id].component_ranges = std::move(component_ranges);
     }
     else if (type.kind == Type::Kind::Matrix)
     {
@@ -7799,13 +8564,22 @@ void SPIRVSimulator::Op_CompositeConstruct(const Instruction& instruction)
     {
         auto aggregate = std::make_shared<AggregateV>();
         aggregate->elems.reserve(instruction.word_count - 3);
-        for (auto i = 3; i < instruction.word_count; ++i)
+
+        std::vector<SubobjectScalarRangeEntry> subobject_scalar_ranges;
+
+        for (uint32_t i = 3; i < instruction.word_count; ++i)
         {
-          ExtractFlags(instruction.words[i], value_meta);
-          aggregate->elems.push_back(GetValue(instruction.words[i]));
+            const uint32_t operand_id = instruction.words[i];
+            const uint32_t member_index = i - 3;
+
+            ExtractFlags(operand_id, value_meta);
+            aggregate->elems.push_back(GetValue(operand_id));
+            AppendSubobjectScalarRangesFromValue(
+                subobject_scalar_ranges, std::vector<uint32_t>{ member_index }, operand_id);
         }
 
         SetValue(result_id, aggregate);
+        value_meta_[result_id].subobject_scalar_ranges = std::move(subobject_scalar_ranges);
     }
     else if (type.kind == Type::Kind::TensorARM)
     {
@@ -8099,6 +8873,41 @@ void SPIRVSimulator::Op_Load(const Instruction& instruction)
         SetValue(result_id, *pointee_value);
     }
 
+    // Restore non-flag metadata from the most recent internal-memory store,
+    // projecting aggregate metadata when this load selects a stored subobject.
+    if (pointer.storage_class == spv::StorageClass::StorageClassFunction ||
+        pointer.storage_class == spv::StorageClass::StorageClassPrivate ||
+        pointer.storage_class == spv::StorageClass::StorageClassWorkgroup)
+    {
+        StoredValueRecord store_record;
+        if (TryFindReachingStoreForPointer(pointer, pointer_id, store_record))
+        {
+            std::vector<uint32_t> suffix_path;
+            if (TryComputeProjectionPath(store_record.target_pointer, pointer, suffix_path))
+            {
+                if (suffix_path.empty())
+                {
+                    ValueMetadata& meta = value_meta_[result_id];
+                    meta.value_range = store_record.stored_meta.value_range;
+                    meta.component_ranges = store_record.stored_meta.component_ranges;
+                    meta.subobject_scalar_ranges = store_record.stored_meta.subobject_scalar_ranges;
+                    meta.address_range_valid = store_record.stored_meta.address_range_valid;
+                    meta.address_range_min = store_record.stored_meta.address_range_min;
+                    meta.address_range_max = store_record.stored_meta.address_range_max;
+                    meta.address_range_stride = store_record.stored_meta.address_range_stride;
+                    meta.address_element_size = store_record.stored_meta.address_element_size;
+                }
+                else
+                {
+                    TryProjectAggregateSubobjectMetadata(result_id,
+                                                         store_record.stored_meta.component_ranges,
+                                                         store_record.stored_meta.subobject_scalar_ranges,
+                                                         suffix_path);
+                }
+            }
+        }
+    }
+
     if (memory_flag_tracker_ &&
         pointer.storage_class != spv::StorageClass::StorageClassFunction &&
         pointer.storage_class != spv::StorageClass::StorageClassImage)
@@ -8152,6 +8961,24 @@ void SPIRVSimulator::Op_CopyObject(const Instruction& instruction)
 
     SetValue(result_id, CopyValue(GetValue(object_id)));
     TransferFlags(result_id, object_id);
+    CopyNonFlagValueMetadata(result_id, object_id);
+
+    bool changed_trace_state = false;
+    auto stored_it = values_stored_.find(object_id);
+    if (stored_it != values_stored_.end())
+    {
+        values_stored_[result_id] = stored_it->second;
+        changed_trace_state = true;
+    }
+    else if (values_stored_.erase(result_id) != 0)
+    {
+        changed_trace_state = true;
+    }
+
+    if (changed_trace_state)
+    {
+        InvalidateDataSourceTraceCache();
+    }
 }
 
 void SPIRVSimulator::Op_CopyLogical(const Instruction& instruction)
@@ -8175,6 +9002,24 @@ void SPIRVSimulator::Op_CopyLogical(const Instruction& instruction)
 
     SetValue(result_id, CopyValue(GetValue(object_id)));
     TransferFlags(result_id, object_id);
+    CopyNonFlagValueMetadata(result_id, object_id);
+
+    bool changed_trace_state = false;
+    auto stored_it = values_stored_.find(object_id);
+    if (stored_it != values_stored_.end())
+    {
+        values_stored_[result_id] = stored_it->second;
+        changed_trace_state = true;
+    }
+    else if (values_stored_.erase(result_id) != 0)
+    {
+        changed_trace_state = true;
+    }
+
+    if (changed_trace_state)
+    {
+        InvalidateDataSourceTraceCache();
+    }
 }
 
 void SPIRVSimulator::Op_Store(const Instruction& instruction)
@@ -8348,7 +9193,15 @@ void SPIRVSimulator::Op_Store(const Instruction& instruction)
         std::cout << "SPIRV simulator: Memory tracking skipped for result with id: " << result_id << " writeout to pointer with handle: " << pointer.pointer_handle << " due to incompatible data chain." << std::endl;
     }
 
-    if (memory_flag_tracker_ && ((value_meta_[result_id].flags | value_meta_[pointer_id].flags) & SPS_FLAG_THREAD_SPECIFIC))
+    // Only externally visible linear-memory stores should trigger dense-range
+    // writeback tracking or fall back to a full dispatch.
+    const bool should_track_dense_store_fallback =
+        pointer.storage_class != spv::StorageClass::StorageClassFunction &&
+        pointer.storage_class != spv::StorageClass::StorageClassPrivate &&
+        pointer.storage_class != spv::StorageClass::StorageClassWorkgroup &&
+        pointer.storage_class != spv::StorageClass::StorageClassImage;
+    if (memory_flag_tracker_ && should_track_dense_store_fallback &&
+        ((value_meta_[result_id].flags | value_meta_[pointer_id].flags) & SPS_FLAG_THREAD_SPECIFIC))
     {
         uint64_t dense_dst_start = 0;
         uint64_t dense_byte_size = 0;
@@ -8403,7 +9256,17 @@ void SPIRVSimulator::Op_Store(const Instruction& instruction)
         has_buffer_writes_ = true;
     }
 
-    values_stored_[pointer_id] = result_id;
+    StoredValueMetadataSnapshot stored_meta = MakeStoredValueMetadataSnapshot(result_id);
+
+    // Prevent later loads from restoring stale metadata from an overlapping
+    // whole-object or subobject store.
+    // TODO: This conservatively drops an ancestor snapshot after a subobject
+    // store, including metadata for untouched siblings that only exists in that
+    // snapshot. Preserve it once partial-store metadata merging and composite
+    // provenance are supported.
+    InvalidateOverlappingStoredValues(pointer);
+
+    values_stored_[pointer_id] = StoredValueRecord{ result_id, pointer, stored_meta };
 
     // Also remember the store by resolved memory location. Relying only on
     // pointer_id misses store/load chains where equivalent pointers are built
@@ -8414,7 +9277,8 @@ void SPIRVSimulator::Op_Store(const Instruction& instruction)
     {
         const PointerV& stored_pointer = std::get<PointerV>(GetValue(pointer_id));
         std::pair<std::byte*, uint64_t> resolved_pointer = ResolvePointerV(stored_pointer);
-        values_stored_by_memory_location_[MakePointerLocationKey(stored_pointer, resolved_pointer.second)] = result_id;
+        values_stored_by_memory_location_[MakePointerLocationKey(stored_pointer, resolved_pointer.second)] =
+            StoredValueRecord{ result_id, stored_pointer, stored_meta };
     }
 
     InvalidateDataSourceTraceCache();
@@ -8513,22 +9377,12 @@ void SPIRVSimulator::Op_AccessChain(const Instruction& instruction)
 
     const Type& result_type         = GetTypeByTypeId(type_id);
     const Type& result_pointee_type = GetTypeByTypeId(result_type.pointer.pointee_type_id);
-    if ((result_pointee_type.kind == Type::Kind::Pointer) &&
-        (result_pointee_type.pointer.storage_class == spv::StorageClass::StorageClassPhysicalStorageBuffer))
+    const bool  is_nested_pbuffer_pointer =
+        (result_pointee_type.kind == Type::Kind::Pointer) &&
+        (result_pointee_type.pointer.storage_class == spv::StorageClass::StorageClassPhysicalStorageBuffer);
+    if (is_nested_pbuffer_pointer)
     {
-        // This pointer points to a physical storage buffer pointer
-        // This is the semi-easy case where we can extract the location of the physical
-        // pointer from this pointer's offsets and storage class, but with the caveat that the resulting pointer
-        // is itself stored in a physical storage buffer (hence we need the containing buffer to find its actual
-        // address)
         new_pointer.pointee_flags |= SPS_FLAG_IS_PBUFFER_PTR;
-        const std::optional<Value> ppointer_value = ReadPointer(new_pointer);
-        if (!ppointer_value)
-        {
-            return;
-        }
-        PointerV ppointer = std::get<PointerV>(*ppointer_value);
-        pointers_to_physical_address_pointers_.push_back(std::pair<PointerV, PointerV>{ new_pointer, ppointer });
     }
 
     // TODO: Compare pointer with candidates here and track
@@ -8536,38 +9390,44 @@ void SPIRVSimulator::Op_AccessChain(const Instruction& instruction)
     SetValue(result_id, new_pointer);
     TransferFlags(result_id, base_id);
 
-    // Build a conservative byte-address range for dense access chains whose
-    // dynamic index is derived from compute builtins. This is intentionally
-    // limited to the final index and only accepts dense element strides.
-    for (uint32_t operand_index = 4; operand_index < instruction.word_count; ++operand_index)
+    const bool has_dense_address_range = TrySetDenseAccessChainAddressRange(instruction, new_pointer);
+    // TrySetDenseAccessChainAddressRange marks the result metadata when it finds a thread-dependent index,
+    // even if dense-range construction later fails.
+    const bool is_thread_specific_access = ValueIsThreadSpecific(result_id);
+
+    if (is_nested_pbuffer_pointer)
     {
-        uint32_t index_id = instruction.words[operand_index];
-        const ValueMetadata& index_meta = value_meta_[index_id];
-        if (!index_meta.range_valid || !index_meta.thread_dependent || !index_meta.dense_range)
-        {
-            continue;
-        }
+        // This pointer points to a physical storage buffer pointer.
+        // This is the semi-easy case where we can extract the location of the physical
+        // pointer from this pointer's offsets and storage class, but with the caveat that the resulting pointer
+        // is itself stored in a physical storage buffer (hence we need the containing buffer to find its actual
+        // address)
 
-        std::pair<std::byte*, uint64_t> resolved = ResolvePointerV(std::get<PointerV>(GetValue(result_id)));
-        uint64_t base_addr = bit_cast<uint64_t>(resolved.first);
-        if (base_addr == 0)
+        // Prefer complete dense slot coverage; queue the representative pair only when expansion is unavailable.
+        const bool queued_dense =
+            has_dense_address_range && TryQueueDenseReadSidePbufferPointers(instruction, result_id, new_pointer);
+        if (!queued_dense)
         {
-            continue;
-        }
+            if (is_thread_specific_access)
+            {
+                // Dense expansion did not prove complete coverage of all thread-specific slots.
+                // This flag only reports incomplete read-side pointer coverage; it does not
+                // recover missing use-sites or automatically set full_dispatch_needed.
+                // When gfxr adds fallback support, it must explicitly consume this state
+                // and decide whether to run full dispatch, enumerate the range in segments,
+                // or use another heavier read-side coverage path.
+                simulation_results_->read_side_pointer_coverage_incomplete = true;
+            }
 
-        uint64_t element_size = GetBitsizeOfType(GetTargetPointerType(std::get<PointerV>(GetValue(result_id)))) / 8;
-        if (element_size == 0)
-        {
-            continue;
-        }
+            const std::optional<Value> ppointer_value = ReadPointer(new_pointer);
+            if (!ppointer_value || !std::holds_alternative<PointerV>(*ppointer_value))
+            {
+                return;
+            }
 
-        ValueMetadata& out_meta = value_meta_[result_id];
-        out_meta.flags |= SPS_FLAG_THREAD_SPECIFIC;
-        out_meta.address_range_valid = true;
-        out_meta.address_element_size = element_size;
-        out_meta.address_range_stride = index_meta.range_stride * element_size;
-        out_meta.address_range_min = base_addr + resolved.second;
-        out_meta.address_range_max = out_meta.address_range_min + ((index_meta.range_max - index_meta.range_min) * element_size);
+            pointers_to_physical_address_pointers_.emplace_back(
+                new_pointer, std::get<PointerV>(*ppointer_value));
+        }
     }
 }
 
@@ -8764,6 +9624,11 @@ void SPIRVSimulator::Op_BranchConditional(const Instruction& instruction)
             visisted_fork_branches_->insert(target_label);
             fork.CreateExecutionFork(*this, condition_id, visisted_fork_branches_, &fork_simulation_data, &fork_simulation_results);
         }
+
+        // Preserve fallback requirements discovered in either execution path.
+        simulation_results_->full_dispatch_needed |= fork_simulation_results.full_dispatch_needed;
+        simulation_results_->read_side_pointer_coverage_incomplete |=
+            fork_simulation_results.read_side_pointer_coverage_incomplete;
 
         const auto& fork_results = fork_simulation_results.physical_address_data;
         if (fork_results.size())
@@ -10313,6 +11178,25 @@ void SPIRVSimulator::Op_Phi(const Instruction& instruction)
         {
             SetValue(result_id, GetValue(variable_id));
             TransferFlags(result_id, variable_id);
+            CopyNonFlagValueMetadata(result_id, variable_id);
+
+            bool changed_trace_state = false;
+            auto stored_it = values_stored_.find(variable_id);
+            if (stored_it != values_stored_.end())
+            {
+                values_stored_[result_id] = stored_it->second;
+                changed_trace_state = true;
+            }
+            else if (values_stored_.erase(result_id) != 0)
+            {
+                changed_trace_state = true;
+            }
+
+            if (changed_trace_state)
+            {
+                InvalidateDataSourceTraceCache();
+            }
+
             return;
         }
     }
@@ -11503,7 +12387,6 @@ void SPIRVSimulator::Op_CompositeExtract(const Instruction& instruction)
     */
     assert(instruction.opcode == spv::Op::OpCompositeExtract);
 
-    // uint32_t type_id = instruction.words[1];
     uint32_t result_id    = instruction.words[2];
     uint32_t composite_id = instruction.words[3];
 
@@ -11543,6 +12426,22 @@ void SPIRVSimulator::Op_CompositeExtract(const Instruction& instruction)
     }
 
     SetValue(result_id, *current_composite);
+
+    if (instruction.word_count >= 5)
+    {
+        std::vector<uint32_t> selected_path;
+        selected_path.reserve(instruction.word_count - 4);
+        for (uint32_t i = 4; i < instruction.word_count; ++i)
+        {
+            selected_path.push_back(instruction.words[i]);
+        }
+
+        const ValueMetadata& composite_meta = value_meta_[composite_id];
+        TryProjectAggregateSubobjectMetadata(result_id,
+                                             composite_meta.component_ranges,
+                                             composite_meta.subobject_scalar_ranges,
+                                             selected_path);
+    }
 
     TransferFlags(result_id, instruction.words[3]);
 }
@@ -12933,97 +13832,153 @@ void SPIRVSimulator::Op_Select(const Instruction& instruction)
     uint32_t obj_1_id     = instruction.words[4];
     uint32_t obj_2_id     = instruction.words[5];
 
-    const Type&  type          = GetTypeByTypeId(type_id);
-    const Value& condition_val = GetValue(condition_id);
-    const Value& val_op1       = GetValue(obj_1_id);
-    const Value& val_op2       = GetValue(obj_2_id);
+    constexpr uint32_t kSpirvVersion14 = (1u << 16u) | (4u << 8u);
 
-    if (type.kind == Type::Kind::Vector)
+    const Type&  result_type    = GetTypeByTypeId(type_id);
+    const Type&  condition_type = GetTypeByResultId(condition_id);
+    const Value& condition_val  = GetValue(condition_id);
+    const Value& val_op1        = GetValue(obj_1_id);
+    const Value& val_op2        = GetValue(obj_2_id);
+
+    const bool result_type_allowed_before_1_4 = result_type.kind == Type::Kind::Pointer ||
+                                                result_type.kind == Type::Kind::BoolT ||
+                                                result_type.kind == Type::Kind::Int ||
+                                                result_type.kind == Type::Kind::Float ||
+                                                result_type.kind == Type::Kind::Vector;
+    assertmc(spirv_version_ >= kSpirvVersion14 || result_type_allowed_before_1_4,
+             "SPIRV simulator: Before SPIR-V 1.4, OpSelect result type must be a pointer, scalar, or vector");
+
+    uint32_t selected_object_id = 0;
+
+    if (condition_type.kind == Type::Kind::Vector)
     {
-        Value result     = std::make_shared<VectorV>();
-        auto  result_vec = std::get<std::shared_ptr<VectorV>>(result);
-
-        assertmc(
-            std::holds_alternative<std::shared_ptr<VectorV>>(val_op1) &&
-                std::holds_alternative<std::shared_ptr<VectorV>>(val_op2),
-            "SPIRV simulator: Operands set to be vector type in Op_Select, but they are not, illegal input parameters");
+        const Type& condition_elem_type = GetTypeByTypeId(condition_type.vector.elem_type_id);
+        assertmc(condition_elem_type.kind == Type::Kind::BoolT,
+                 "SPIRV simulator: OpSelect vector condition components must be Boolean");
+        assertmc(result_type.kind == Type::Kind::Vector,
+                 "SPIRV simulator: A vector OpSelect condition requires a vector result");
         assertmc(std::holds_alternative<std::shared_ptr<VectorV>>(condition_val),
-                "SPIRV simulator: Condition operand set to be vector type in Op_Select, but is is not, illegal input "
-                "parameters");
+                 "SPIRV simulator: OpSelect vector condition does not contain a vector value");
+        assertmc(std::holds_alternative<std::shared_ptr<VectorV>>(val_op1) &&
+                     std::holds_alternative<std::shared_ptr<VectorV>>(val_op2),
+                 "SPIRV simulator: OpSelect vector operands do not contain vector values");
 
-        auto vec1     = std::get<std::shared_ptr<VectorV>>(val_op1);
-        auto vec2     = std::get<std::shared_ptr<VectorV>>(val_op2);
-        auto cond_vec = std::get<std::shared_ptr<VectorV>>(condition_val);
+        const auto& cond_vec = std::get<std::shared_ptr<VectorV>>(condition_val);
+        const auto& vec1     = std::get<std::shared_ptr<VectorV>>(val_op1);
+        const auto& vec2     = std::get<std::shared_ptr<VectorV>>(val_op2);
 
-        assertmc((vec1->elems.size() == vec2->elems.size()) && (vec1->elems.size() == cond_vec->elems.size()) &&
-                    (cond_vec->elems.size() == type.vector.elem_count),
-                "SPIRV simulator: Operands are vector type but not of equal length in Op_Select");
+        assertmc(condition_type.vector.elem_count == result_type.vector.elem_count &&
+                     cond_vec->elems.size() == result_type.vector.elem_count &&
+                     vec1->elems.size() == result_type.vector.elem_count &&
+                     vec2->elems.size() == result_type.vector.elem_count,
+                 "SPIRV simulator: OpSelect vector condition, operands, and result have different lengths");
 
-        bool accessed_4 = false;
-        bool accessed_5 = false;
+        const ValueMetadata& obj_1_meta = value_meta_[obj_1_id];
+        const ValueMetadata& obj_2_meta = value_meta_[obj_2_id];
+        const bool track_component_ranges =
+            !obj_1_meta.component_ranges.empty() || !obj_2_meta.component_ranges.empty();
 
-        for (uint32_t i = 0; i < type.vector.elem_count; ++i)
+        std::vector<DenseValueRangeInfo> result_component_ranges;
+        if (track_component_ranges)
         {
-            Value elem_result;
+            result_component_ranges.reserve(result_type.vector.elem_count);
+        }
 
-            uint64_t cond_val = std::get<uint64_t>(cond_vec->elems[i]);
+        auto result_vec = std::make_shared<VectorV>();
+        result_vec->elems.reserve(result_type.vector.elem_count);
 
-            if (cond_val)
+        bool accessed_obj_1 = false;
+        bool accessed_obj_2 = false;
+
+        for (uint32_t i = 0; i < result_type.vector.elem_count; ++i)
+        {
+            assertmc(std::holds_alternative<uint64_t>(cond_vec->elems[i]),
+                     "SPIRV simulator: OpSelect vector condition component is not Boolean");
+
+            const bool select_obj_1 = std::get<uint64_t>(cond_vec->elems[i]) != 0;
+            const auto& selected_vec = select_obj_1 ? vec1 : vec2;
+            const ValueMetadata& selected_meta = select_obj_1 ? obj_1_meta : obj_2_meta;
+
+            result_vec->elems.push_back(selected_vec->elems[i]);
+            accessed_obj_1 |= select_obj_1;
+            accessed_obj_2 |= !select_obj_1;
+
+            if (track_component_ranges)
             {
-                result_vec->elems.push_back(vec1->elems[i]);
-                accessed_4 = true;
-            }
-            else
-            {
-                result_vec->elems.push_back(vec2->elems[i]);
-                accessed_5 = true;
+                if (i < selected_meta.component_ranges.size())
+                {
+                    result_component_ranges.push_back(selected_meta.component_ranges[i]);
+                }
+                else
+                {
+                    result_component_ranges.push_back(DenseValueRangeInfo{});
+                }
             }
         }
 
-        SetValue(result_id, result);
-
-        if (accessed_4)
+        SetValue(result_id, result_vec);
+        if (track_component_ranges)
         {
-            TransferFlags(result_id, instruction.words[4]);
+            value_meta_[result_id].component_ranges = std::move(result_component_ranges);
         }
 
-        if (accessed_5)
+        if (accessed_obj_1)
         {
-            TransferFlags(result_id, instruction.words[5]);
+            TransferFlags(result_id, obj_1_id);
+        }
+        if (accessed_obj_2)
+        {
+            TransferFlags(result_id, obj_2_id);
         }
     }
     else
     {
+        assertmc(condition_type.kind == Type::Kind::BoolT,
+                 "SPIRV simulator: OpSelect condition must be a Boolean scalar or Boolean vector");
         assertmc(std::holds_alternative<uint64_t>(condition_val),
-                "SPIRV simulator: Op_Select condition must be a bool or a vector of bools");
-        uint64_t condition_int = std::get<uint64_t>(condition_val);
+                 "SPIRV simulator: Scalar OpSelect condition does not contain a Boolean value");
+        assertmc(result_type.kind != Type::Kind::Vector || spirv_version_ >= kSpirvVersion14,
+                 "SPIRV simulator: Scalar OpSelect condition with a vector result requires SPIR-V 1.4 or later");
 
-        bool accessed_4 = false;
-        bool accessed_5 = false;
+        selected_object_id = std::get<uint64_t>(condition_val) ? obj_1_id : obj_2_id;
+        const Value& selected_value = selected_object_id == obj_1_id ? val_op1 : val_op2;
 
-        if (condition_int)
-        {
-            SetValue(result_id, val_op1);
-            accessed_4 = true;
-        }
-        else
-        {
-            SetValue(result_id, val_op2);
-            accessed_5 = true;
-        }
-
-        if (accessed_4)
-        {
-            TransferFlags(result_id, instruction.words[4]);
-        }
-
-        if (accessed_5)
-        {
-            TransferFlags(result_id, instruction.words[5]);
-        }
+        // A scalar condition selects one complete object, so metadata and
+        // stored-value provenance come from the same selected object.
+        SetValue(result_id, selected_value);
+        CopyNonFlagValueMetadata(result_id, selected_object_id);
+        TransferFlags(result_id, selected_object_id);
     }
 
-    TransferFlags(result_id, instruction.words[3]);
+    TransferFlags(result_id, condition_id);
+
+    bool changed_trace_state = false;
+    if (result_type.kind == Type::Kind::Pointer)
+    {
+        assertmc(selected_object_id != 0,
+                 "SPIRV simulator: Pointer OpSelect result must come from a scalar condition");
+
+        auto stored_it = values_stored_.find(selected_object_id);
+        if (stored_it != values_stored_.end())
+        {
+            values_stored_[result_id] = stored_it->second;
+            changed_trace_state = true;
+        }
+        else if (values_stored_.erase(result_id) != 0)
+        {
+            changed_trace_state = true;
+        }
+    }
+    else if (values_stored_.erase(result_id) != 0)
+    {
+        // Non-pointer results must not retain pointer provenance.
+        changed_trace_state = true;
+    }
+
+    if (changed_trace_state)
+    {
+        InvalidateDataSourceTraceCache();
+    }
 }
 
 void SPIRVSimulator::Op_IEqual(const Instruction& instruction)
@@ -13202,6 +14157,49 @@ void SPIRVSimulator::Op_CompositeInsert(const Instruction& instruction)
 
     TransferFlags(result_id, instruction.words[3]);
     TransferFlags(result_id, instruction.words[4]);
+
+    // Start with the base composite metadata, then replace the metadata for
+    // the subobject overwritten by this insert.
+    CopyNonFlagValueMetadata(result_id, composite_id);
+
+    // The literal indexes form the logical path of the replaced subobject.
+    std::vector<uint32_t> insert_prefix;
+    insert_prefix.reserve(instruction.word_count - 5);
+    for (uint32_t i = 5; i < instruction.word_count; ++i)
+    {
+        insert_prefix.push_back(instruction.words[i]);
+    }
+
+    ValueMetadata& result_meta = value_meta_[result_id];
+    // Remove stale leaf ranges below the replaced path, then materialize the
+    // inserted object's ranges under that same path.
+    EraseSubobjectScalarRangesByPrefix(result_meta.subobject_scalar_ranges, insert_prefix);
+    AppendSubobjectScalarRangesFromValue(result_meta.subobject_scalar_ranges, insert_prefix, obj_id);
+
+    // Keep the vector-specific fast path consistent with the generic
+    // subobject metadata for a direct component insert.
+    const Type& result_type = GetTypeByResultId(result_id);
+    if (result_type.kind == Type::Kind::Vector && insert_prefix.size() == 1)
+    {
+        if (result_meta.component_ranges.size() < result_type.vector.elem_count)
+        {
+            result_meta.component_ranges.resize(result_type.vector.elem_count);
+        }
+
+        const uint32_t component_index = insert_prefix[0];
+        if (component_index < result_meta.component_ranges.size())
+        {
+            if (value_meta_[obj_id].value_range.valid)
+            {
+                result_meta.component_ranges[component_index] = value_meta_[obj_id].value_range;
+            }
+            else
+            {
+                result_meta.component_ranges[component_index] = DenseValueRangeInfo{};
+            }
+        }
+    }
+
 }
 
 void SPIRVSimulator::Op_Transpose(const Instruction& instruction)
@@ -13797,21 +14795,20 @@ void SPIRVSimulator::Op_VectorShuffle(const Instruction& instruction)
     for (uint32_t literal_index = 5; literal_index < instruction.word_count; ++literal_index)
     {
         uint32_t component_index = instruction.words[literal_index];
-        assertmc(component_index < values.size(), "SPIRV simulator: Literal index OOB");
-
-        if (component_index == 0xFFFFFFFF)
+        if (component_index == 0xFFFFFFFFu)
         {
             Value undef_val = (uint64_t)0xFFFFFFFF;
             result->elems.push_back(undef_val);
+            continue;
         }
-        else
-        {
-            result->elems.push_back(values[component_index]);
-        }
+
+        assertmc(component_index < values.size(), "SPIRV simulator: Literal index OOB");
+        result->elems.push_back(values[component_index]);
     }
 
     SetValue(result_id, result);
 
+    TryBuildVectorShuffleComponentRanges(result_id, vec1_id, vec2_id, instruction);
     TransferFlags(result_id, instruction.words[3]);
     TransferFlags(result_id, instruction.words[4]);
 }
@@ -18739,11 +19736,9 @@ void SPIRVSimulator::Op_CooperativeMatrixStoreKHR(const Instruction& instruction
         assertmc(stride_type.kind == Type::Kind::Int, "SPIRV Simulmator: Stride must be integer type");
     }
 
-    Value pointer = GetValue(pointer_id);
-    if (!WritePointer(std::get<PointerV>(pointer), GetValue(object_id)))
-    {
-        return;
-    }
+    const Value& pointer_value = GetValue(pointer_id);
+    const PointerV& pointer = std::get<PointerV>(pointer_value);
+    WritePointer(pointer, GetValue(object_id));
     TransferFlagsToPointee(pointer_id, object_id);
 
     if (ValueIsArbitrary(object_id))
@@ -18751,7 +19746,16 @@ void SPIRVSimulator::Op_CooperativeMatrixStoreKHR(const Instruction& instruction
         simulation_results_->had_arbitrary_write = true;
     }
     has_buffer_writes_ = true;
-    values_stored_[pointer_id] = object_id;
+
+    StoredValueMetadataSnapshot stored_meta = MakeStoredValueMetadataSnapshot(object_id);
+    InvalidateOverlappingStoredValues(pointer);
+    values_stored_[pointer_id] = StoredValueRecord{ object_id, pointer, stored_meta };
+
+    std::pair<std::byte*, uint64_t> resolved_pointer = ResolvePointerV(pointer);
+    values_stored_by_memory_location_[MakePointerLocationKey(pointer, resolved_pointer.second)] =
+        StoredValueRecord{ object_id, pointer, stored_meta };
+
+    InvalidateDataSourceTraceCache();
 }
 
 void SPIRVSimulator::Op_CooperativeMatrixLengthKHR(const Instruction& instruction)

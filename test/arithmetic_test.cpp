@@ -325,11 +325,11 @@ class RangePropagationTests : public SPIRVSimulatorMockBase, public Test
     {
         value_meta_.resize(std::max<size_t>(value_meta_.size(), result_id + 1));
         ::SPIRVSimulator::ValueMetadata& meta = value_meta_[result_id];
-        meta.range_valid                      = true;
-        meta.dense_range                      = true;
-        meta.range_min                        = min;
-        meta.range_max                        = max;
-        meta.range_stride                     = 1;
+        meta.value_range.valid              = true;
+        meta.value_range.dense_range        = true;
+        meta.value_range.min                = min;
+        meta.value_range.max                = max;
+        meta.value_range.stride             = 1;
     }
 
     void PropagateMul(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id)
@@ -359,7 +359,7 @@ TEST_F(RangePropagationTests, VectorMultiplySkipsScalarRangePropagation)
 
     PropagateMul(result_id, lhs_id, rhs_id);
 
-    EXPECT_FALSE(GetMetadata(result_id).range_valid);
+    EXPECT_FALSE(GetMetadata(result_id).value_range.valid);
 }
 
 TEST_F(RangePropagationTests, ScalarMultiplyPropagatesRange)
@@ -378,10 +378,10 @@ TEST_F(RangePropagationTests, ScalarMultiplyPropagatesRange)
     PropagateMul(result_id, lhs_id, rhs_id);
 
     const ::SPIRVSimulator::ValueMetadata& result_meta = GetMetadata(result_id);
-    EXPECT_TRUE(result_meta.range_valid);
-    EXPECT_EQ(result_meta.range_min, 0u);
-    EXPECT_EQ(result_meta.range_max, 60u);
-    EXPECT_EQ(result_meta.range_stride, 4u);
+    EXPECT_TRUE(result_meta.value_range.valid);
+    EXPECT_EQ(result_meta.value_range.min, 0u);
+    EXPECT_EQ(result_meta.value_range.max, 60u);
+    EXPECT_EQ(result_meta.value_range.stride, 4u);
 }
 
 class CoopMatrixMath : public SPIRVSimulatorMockBase, public TestWithParam<TestParameters>

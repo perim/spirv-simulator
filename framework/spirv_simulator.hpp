@@ -251,7 +251,9 @@ struct SimulationData
     // Dispatch dimensions for compute shaders. Local size is normally derived
     // from OpExecutionMode LocalSize/LocalSizeId when possible. The user still
     // needs to provide workgroup counts for range analysis.
+    bool has_compute_num_workgroups = false;
     ComputeDispatchDimensions compute_num_workgroups;
+    ComputeDispatchDimensions base_workgroups = { 0, 0, 0 };
 
     // Optional override. If valid is false, the simulator will derive local size
     // from the selected entry point's execution mode when the shader provides it.
@@ -274,6 +276,11 @@ struct SimulationResults
 
     // Set to true if the simulator encountered a case that requires all threads in a dispatch to run in order to guarantee no pointers are missed
     bool full_dispatch_needed = false;
+
+    // Set when a thread-specific nested pointer access could not be expanded into a complete set of source
+    // pointer-table slots. This does not trigger full_dispatch_needed; consumers must explicitly choose a
+    // read-side fallback such as full dispatch, segmented enumeration, or another heavier coverage path.
+    bool read_side_pointer_coverage_incomplete = false;
 
     // Set to true if the simulator encounters a loop lasting longer than MAX_LOOP_COUNT iterations, this will cause it to abort the loop and continue (simulator will assume a hang due to invalid inputs)
     bool aborted_long_loop = false;
@@ -632,19 +639,48 @@ using Value = std::variant<std::monostate,
                            PointerV,
                            SampledImageV>;
 
+// Conservative integer/byte range metadata for values derived from compute
+// builtins. The simulator still executes one invocation, but this records
+// the dense range represented by the expression when that is known.
+struct DenseValueRangeInfo
+{
+    bool     valid = false;
+    bool     thread_dependent = false;
+    bool     dense_range = false;
+    uint64_t min = 0;
+    uint64_t max = 0; // inclusive
+    uint64_t stride = 1;
+};
+
+struct SubobjectScalarRangeEntry
+{
+    // Logical subobject path relative to the current value root.
+    // Examples: {0} -> struct member 0,
+    //           {1,1} -> struct member 1 then vector component 1.
+    std::vector<uint32_t> path;
+
+    // Scalar range for the leaf reached by path.
+    DenseValueRangeInfo value_range;
+};
+
 struct ValueMetadata
 {
     uint64_t flags = 0;
 
-    // Conservative integer/byte range metadata for values derived from compute
-    // builtins. The simulator still executes one invocation, but this records
-    // the dense range represented by the expression when that is known.
-    bool     range_valid = false;
-    bool     thread_dependent = false;
-    bool     dense_range = false;
-    uint64_t range_min = 0;
-    uint64_t range_max = 0; // inclusive
-    uint64_t range_stride = 1;
+    // Coarse value-range metadata for the current SSA result.
+    // The representative concrete value itself is still stored in Value,
+    // not in ValueMetadata.
+    DenseValueRangeInfo value_range;
+
+    // Optional per-component range metadata for vector/aggregate results.
+    // component_ranges.empty() means there is no component-level metadata.
+    // component_ranges[i].valid describes whether logical component i has a usable range.
+    std::vector<DenseValueRangeInfo> component_ranges;
+
+    // Optional scalar leaf metadata for nested aggregate subobjects.
+    // This extends component_ranges to paths such as {member}, {member, component},
+    // or deeper aggregate/member chains.
+    std::vector<SubobjectScalarRangeEntry> subobject_scalar_ranges;
 
     // For pointer values, this optionally describes the byte addresses covered
     // by a dense thread-dependent access chain.
@@ -734,6 +770,34 @@ struct PointerLocationKeyHash
 
         return static_cast<size_t>(hash);
     }
+};
+
+struct StoredValueMetadataSnapshot
+{
+    DenseValueRangeInfo value_range;
+    std::vector<DenseValueRangeInfo> component_ranges;
+    std::vector<SubobjectScalarRangeEntry> subobject_scalar_ranges;
+
+    bool     address_range_valid = false;
+    uint64_t address_range_min = 0;
+    uint64_t address_range_max = 0;
+    uint64_t address_range_stride = 1;
+    uint64_t address_element_size = 0;
+};
+
+struct StoredValueRecord
+{
+    // SSA result id of the value that was stored.
+    uint32_t stored_result_id = 0;
+
+    // Snapshot of the store target pointer at the moment of OpStore.
+    // Used to match later loads and compute suffix-path projection.
+    PointerV target_pointer;
+
+    // Store-time snapshot of the stored value's non-flag metadata.
+    // This is the authoritative source for load-time restore/projection,
+    // so later logic does not need to look back at value_meta_[stored_result_id].
+    StoredValueMetadataSnapshot stored_meta;
 };
 
 struct SampledImageV
@@ -1259,6 +1323,7 @@ class SPIRVSimulator
     UnorderedMap<uint32_t, spv::ExecutionModel>   entry_point_models_;
     UnorderedMap<uint32_t, ComputeLocalSize>       entry_point_local_sizes_;
     ComputeLocalSize                               active_compute_local_size_;
+    uint32_t                                       spirv_version_ = 0;
     std::vector<uint32_t>                               program_words_;
     std::span<const uint32_t>                           stream_;
     std::vector<Instruction>                            instructions_;
@@ -1280,18 +1345,20 @@ class SPIRVSimulator
 
     Type               void_type_;
 
-    // This maps the result ID of pointers to the result ID of values stored
-    // through them. This is kept for the simple case where the exact same
-    // pointer ID is used by a later OpLoad.
-    UnorderedMap<uint32_t, uint32_t> values_stored_;
+    // This maps SSA pointer result IDs to the most recent StoredValueRecord
+    // written through them. It is the fast path for cases where a later read
+    // reuses the exact same pointer result ID or an alias that forwards this
+    // record through values_stored_.
+    UnorderedMap<uint32_t, StoredValueRecord> values_stored_;
 
-    // Same logical information as values_stored_, but keyed by the resolved
-    // memory location rather than by the SSA pointer ID. This handles the
-    // common case where a store and a later load use different OpAccessChain
-    // result IDs that resolve to the same memory.
+    // Same StoredValueRecord information as values_stored_, but keyed by the
+    // resolved logical memory location instead of the SSA pointer ID. This is
+    // used when a store and a later read reach the same object through
+    // different OpAccessChain results or other pointer aliases.
     //
-    // The key encodes storage class, base object, byte offset and access path.
-    UnorderedMap<PointerLocationKey, uint32_t, PointerLocationKeyHash> values_stored_by_memory_location_;
+    // The key encodes storage class, base object, byte offset and access path
+    // of the resolved target location.
+    UnorderedMap<PointerLocationKey, StoredValueRecord, PointerLocationKeyHash> values_stored_by_memory_location_;
 
     // For OpFunctionCall results, the source IDs inside the callee are not
     // always safe to chase after returning, especially when locals/parameters
@@ -1422,12 +1489,31 @@ class SPIRVSimulator
 
     uint64_t GetUIntScalarValue(uint32_t result_id) const;
     void DeriveActiveComputeLocalSize(uint32_t entry_point_function_id);
+    void CopyNonFlagValueMetadata(uint32_t target_rid, uint32_t source_rid);
+    bool PathStartsWith(const std::vector<uint32_t>& path, const std::vector<uint32_t>& prefix) const;
+    void AppendSubobjectScalarRangesFromValue(std::vector<SubobjectScalarRangeEntry>& dst, const std::vector<uint32_t>& prefix, uint32_t source_id) const;
+    void EraseSubobjectScalarRangesByPrefix(std::vector<SubobjectScalarRangeEntry>& entries, const std::vector<uint32_t>& prefix) const;
+
+    bool TryBuildVectorShuffleComponentRanges(uint32_t result_id, uint32_t vec1_id, uint32_t vec2_id, const Instruction& instruction);
+    StoredValueMetadataSnapshot MakeStoredValueMetadataSnapshot(uint32_t value_id) const;
+    bool StoredTargetsOverlap(const PointerV& lhs, const PointerV& rhs) const;
+    void InvalidateOverlappingStoredValues(const PointerV& stored_pointer);
+    bool TryFindReachingStoreForPointer(const PointerV& pointer, uint32_t pointer_id, StoredValueRecord& out_record) const;
+    bool TryComputeProjectionPath(const PointerV& target_pointer, const PointerV& read_pointer, std::vector<uint32_t>& out_suffix_path) const;
+    bool TryProjectAggregateSubobjectMetadata(uint32_t result_id,
+                                              const std::vector<DenseValueRangeInfo>& source_component_ranges,
+                                              const std::vector<SubobjectScalarRangeEntry>& source_subobject_ranges,
+                                              const std::vector<uint32_t>& selected_path);
     bool TrySetComputeBuiltinValueAndRange(uint32_t result_id, const PointerV& pointer, uint32_t type_id);
     void PropagateBinaryRangeAdd(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id);
     void PropagateBinaryRangeSub(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id);
     void PropagateBinaryRangeMul(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id);
     void PropagateBinaryRangeDiv(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id);
     void PropagateBinaryRangeMod(uint32_t result_id, uint32_t lhs_id, uint32_t rhs_id);
+    bool TrySetDenseAccessChainAddressRange(const Instruction& instruction, const PointerV& result_pointer);
+    bool TryQueueDenseReadSidePbufferPointers(const Instruction& instruction,
+                                              uint32_t           result_id,
+                                              const PointerV&    representative_slot_pointer);
     bool TryGetDenseStoreRange(const PointerV& pointer, uint32_t pointer_id, uint32_t result_id, uint64_t& dst_start, uint64_t& byte_size, uint64_t& element_size);
     void PromoteUniformDerivedRangeForPointerValue(uint64_t source_addr, uint64_t element_size);
 

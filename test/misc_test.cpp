@@ -48,7 +48,9 @@ TEST_F(AccessChainForkTests, NegativeLogicalIndexStopsForkOnlyWhenDereferenced)
     EXPECT_CALL(*this, GetTypeByResultId(base_id)).WillOnce(ReturnRef(base_type));
     EXPECT_CALL(*this, GetIntegerWidthByResultId(index_id)).WillOnce(Return(32));
     EXPECT_CALL(*this, GetValue(index_id)).WillOnce(ReturnRef(index));
-    EXPECT_CALL(*this, GetTypeByTypeId(result_type_id)).WillOnce(ReturnRef(result_type));
+    EXPECT_CALL(*this, GetTypeByTypeId(result_type_id))
+        .Times(AtLeast(1))
+        .WillRepeatedly(ReturnRef(result_type));
     EXPECT_CALL(*this, SetValue(result_id, _, true)).WillOnce(SaveArg<1>(&result));
     EXPECT_CALL(*this, TransferFlags(result_id, TypedEq<uint32_t>(base_id)));
 
