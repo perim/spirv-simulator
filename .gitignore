@@ -3,3 +3,4 @@ test_shaders/local
 
 .cache
 .vscode
+build_release/
