@@ -7454,11 +7454,13 @@ void SPIRVSimulator::Op_Variable(const Instruction& instruction)
 
         const std::byte* external_pointer = nullptr;
 
-        if (simulation_data_->bindings.find(descriptor_set) != simulation_data_->bindings.end())
+        auto set_it = simulation_data_->bindings.find(descriptor_set);
+        if (set_it != simulation_data_->bindings.end())
         {
-            if (simulation_data_->bindings.at(descriptor_set).find(binding) != simulation_data_->bindings.at(descriptor_set).end())
+            auto binding_it = set_it->second.find(binding);
+            if (binding_it != set_it->second.end())
             {
-                external_pointer = static_cast<std::byte*>(simulation_data_->bindings.at(descriptor_set).at(binding));
+                external_pointer = static_cast<const std::byte*>(binding_it->second);
             }
         }
 
