@@ -9367,9 +9367,9 @@ void SPIRVSimulator::Op_Name(const Instruction& instruction)
     std::string label = std::string((char*)(&instruction.words[2]), (instruction.word_count - 2) * 4);
     label.erase(std::find(label.begin(), label.end(), '\0'), label.end());
 
-    if (entry_points_.find(target_id) != entry_points_.end())
+    if (auto it = entry_points_.find(target_id); it != entry_points_.end())
     {
-        entry_points_[target_id] = label;
+        it->second = label;
     }
 }
 
